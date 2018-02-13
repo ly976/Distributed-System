@@ -1,0 +1,3221 @@
+From 5eb8cdd6c70eb05c70ea6118e7fa896ae4484b98 Mon Sep 17 00:00:00 2001
+From: Luying Yan <ly976@nyu.edu>
+Date: Thu, 7 Dec 2017 13:53:46 -0500
+Subject: [PATCH] implemented shardmaster and shardkv
+
+---
+ src/kvpaxos/client.go     |  101 +++--
+ src/kvpaxos/common.go     |   45 +-
+ src/kvpaxos/server.go     |  327 ++++++++++----
+ src/paxos/paxos.go        | 1044 ++++++++++++++++++++++++++++++++++++++-------
+ src/shardkv/client.go     |   39 +-
+ src/shardkv/common.go     |   32 ++
+ src/shardkv/server.go     |  650 +++++++++++++++++++++++++++-
+ src/shardmaster/common.go |  203 ++++++++-
+ src/shardmaster/server.go |  287 +++++++++++++
+ 9 files changed, 2433 insertions(+), 295 deletions(-)
+ mode change 100644 => 100755 src/kvpaxos/client.go
+ mode change 100644 => 100755 src/kvpaxos/common.go
+ mode change 100644 => 100755 src/kvpaxos/server.go
+
+diff --git a/src/kvpaxos/client.go b/src/kvpaxos/client.go
+old mode 100644
+new mode 100755
+index f1a361c..76df55f
+--- a/src/kvpaxos/client.go
++++ b/src/kvpaxos/client.go
+@@ -1,29 +1,38 @@
+ package kvpaxos
+ 
+ import "net/rpc"
++import "fmt"
+ import "crypto/rand"
+ import "math/big"
+-
+-import "fmt"
++import "strconv"
++import "math"
++//import "log"
+ 
+ type Clerk struct {
+-	servers []string
+-	// You will have to modify this struct.
++  servers []string
++  // You will have to modify this struct.
++  me string
++  seq int
+ }
+ 
++
++func MakeClerk(servers []string) *Clerk {
++  ck := new(Clerk)
++  ck.servers = servers
++  // You'll have to add code here.
++  ck.me = strconv.FormatInt(nrand(), 10)
++  ck.seq = 0
++  return ck
++}
++
++
+ func nrand() int64 {
+ 	max := big.NewInt(int64(1) << 62)
+ 	bigx, _ := rand.Int(rand.Reader, max)
+ 	x := bigx.Int64()
+-	return x
++  return x
+ }
+ 
+-func MakeClerk(servers []string) *Clerk {
+-	ck := new(Clerk)
+-	ck.servers = servers
+-	// You'll have to add code here.
+-	return ck
+-}
+ 
+ //
+ // call() sends an RPC to the rpcname handler on server srv
+@@ -35,28 +44,25 @@ func MakeClerk(servers []string) *Clerk {
+ // if call() was not able to contact the server. in particular,
+ // the reply's contents are only valid if call() returned true.
+ //
+-// you should assume that call() will return an
+-// error after a while if the server is dead.
+-// don't provide your own time-out mechanism.
++// you should assume that call() will time out and return an
++// error after a while if it doesn't get a reply from the server.
+ //
+ // please use call() to send all RPCs, in client.go and server.go.
+ // please don't change this function.
+ //
+ func call(srv string, rpcname string,
+-	args interface{}, reply interface{}) bool {
+-	c, errx := rpc.Dial("unix", srv)
+-	if errx != nil {
+-		return false
+-	}
+-	defer c.Close()
+-
+-	err := c.Call(rpcname, args, reply)
+-	if err == nil {
+-		return true
+-	}
+-
+-	fmt.Println(err)
+-	return false
++          args interface{}, reply interface{}) bool {
++  c, errx := rpc.Dial("unix", srv)
++  if errx != nil {
++    return false
++  }
++  defer c.Close()
++  err := c.Call(rpcname, args, reply)
++  if err == nil {
++    return true
++  }
++  fmt.Println(err)
++  return false
+ }
+ 
+ //
+@@ -65,20 +71,49 @@ func call(srv string, rpcname string,
+ // keeps trying forever in the face of all other errors.
+ //
+ func (ck *Clerk) Get(key string) string {
+-	// You will have to modify this function.
+-	return ""
++	var reply GetReply	
++	args := &GetArgs{key, ck.me, ck.seq}
++	dest := int(math.Mod(float64(ck.seq), float64(len(ck.servers))))
++	ck.seq++ //can do this bc only one outstanding req
++	ok := call(ck.servers[dest], "KVPaxos.Get", args, &reply);
++	for !ok || reply.Err != "" {
++		if reply.Err == ErrNoKey {
++			return ""
++		}
++		reply.Err = ""
++		//try a new server
++		dest = int(math.Mod(float64(dest+1), float64(len(ck.servers))))
++		ok = call(ck.servers[dest], "KVPaxos.Get", args, &reply);
++	}
++	return reply.Value
+ }
+ 
+ //
+-// shared by Put and Append.
++// set the value for a key.
++// keeps trying until it succeeds.
+ //
+-func (ck *Clerk) PutAppend(key string, value string, op string) {
+-	// You will have to modify this function.
++func (ck *Clerk) PutAppend(key string, value string, op string){
++	var reply PutReply	
++	args := &PutArgs{key, value, op, ck.me, ck.seq}
++	dest := int(math.Mod(float64(ck.seq), float64(len(ck.servers))))
++	ck.seq++ //can do this bc only one outstanding req
++	ok := call(ck.servers[dest], "KVPaxos.Put", args, &reply);
++	for !ok || reply.Err != "" {
++		//try a new server
++		dest = int(math.Mod(float64(dest+1), float64(len(ck.servers))))
++		reply.Err = ""
++		ok = call(ck.servers[dest], "KVPaxos.Put", args, &reply);
++	}
+ }
+ 
++
+ func (ck *Clerk) Put(key string, value string) {
+ 	ck.PutAppend(key, value, "Put")
+ }
+ func (ck *Clerk) Append(key string, value string) {
+ 	ck.PutAppend(key, value, "Append")
+ }
++
++
++
++
+diff --git a/src/kvpaxos/common.go b/src/kvpaxos/common.go
+old mode 100644
+new mode 100755
+index 5618957..6a70e99
+--- a/src/kvpaxos/common.go
++++ b/src/kvpaxos/common.go
+@@ -1,33 +1,44 @@
+ package kvpaxos
+ 
+ const (
+-	OK       = "OK"
+-	ErrNoKey = "ErrNoKey"
++  OK = "OK"
++  ErrNoKey = "ErrNoKey"
++  ErrPut = "Undefined Put Error"
++  ErrGet = "Undefined Get Error"
++  Nobody = "Nobody"
++  Put = "Put"
++  Append = "Append"
++  Get = "Get"
+ )
+-
+ type Err string
+ 
++
+ // Put or Append
+-type PutAppendArgs struct {
+-	// You'll have to add definitions here.
+-	Key   string
+-	Value string
+-	Op    string // "Put" or "Append"
+-	// You'll have to add definitions here.
+-	// Field names must start with capital letters,
+-	// otherwise RPC will break.
++type PutArgs struct {
++  // You'll have to add definitions here.
++  Key string
++  Value string
++  Op  string // "Put" or "Append"
++  // You'll have to add definitions here.
++  // Field names must start with capital letters,
++  // otherwise RPC will break.
++  From string
++  SeqNum int
+ }
+ 
+-type PutAppendReply struct {
+-	Err Err
++type PutReply struct {
++  Err Err
+ }
+ 
+ type GetArgs struct {
+-	Key string
+-	// You'll have to add definitions here.
++  Key string
++  // You'll have to add definitions here.
++  From string
++  SeqNum int
+ }
+ 
+ type GetReply struct {
+-	Err   Err
+-	Value string
++  Err Err
++  Value string
+ }
++
+diff --git a/src/kvpaxos/server.go b/src/kvpaxos/server.go
+old mode 100644
+new mode 100755
+index c3828da..6bc59c7
+--- a/src/kvpaxos/server.go
++++ b/src/kvpaxos/server.go
+@@ -11,49 +11,223 @@ import "os"
+ import "syscall"
+ import "encoding/gob"
+ import "math/rand"
++import "time"
+ 
+-
+-const Debug = 0
++const Debug=0
+ 
+ func DPrintf(format string, a ...interface{}) (n int, err error) {
+-	if Debug > 0 {
+-		log.Printf(format, a...)
+-	}
+-	return
++  if Debug > 0 {
++    log.Printf(format, a...)
++  }
++  return
+ }
+ 
+ 
+ type Op struct {
+-	// Your definitions here.
+-	// Field names must start with capital letters,
+-	// otherwise RPC will break.
++  // Your definitions here.
++  // Field names must start with capital letters,
++  // otherwise RPC will break.
++  From string
++  CSeq int
++  PSeq int //paxos sequence number
++  Proposer int //for debug
++
++  Type string
++  Key string
++  Value string
++  Err Err
+ }
+ 
+ type KVPaxos struct {
+-	mu         sync.Mutex
+-	l          net.Listener
+-	me         int
+-	dead       int32 // for testing
+-	unreliable int32 // for testing
+-	px         *paxos.Paxos
+-
+-	// Your definitions here.
++  mu sync.Mutex
++  l net.Listener
++  me int
++  dead  int32 // for testing 
++  unreliable int32 // for testing
++  px *paxos.Paxos
++ 
++  // Your definitions here
++  log map[int]*Op
++  responses map[string]*Op
++  db map[string]string
++  outstanding map[int]chan *Op
++  highestApplied int
+ }
+ 
+ 
+ func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
+-	// Your code here.
++	seq, c := kv.seqChan()
++
++	proposedVal := Op{From: args.From, CSeq: args.SeqNum, PSeq: seq, 
++		Proposer: kv.me, Type:  Get, Key: args.Key}
++	
++	kv.px.Start(seq, proposedVal)
++	acceptedVal := <- c
++
++	//start over if it wasn't what we proposed
++	if acceptedVal.From != args.From || acceptedVal.CSeq != args.SeqNum {
++		reply.Err = Err(ErrGet)
++		//housecleaning
++		kv.mu.Lock()
++		delete(kv.outstanding, seq)
++		c <- &Op{}
++		kv.mu.Unlock()
++		return nil
++	}
++	reply.Err = acceptedVal.Err
++	reply.Value = acceptedVal.Value		
++	
++	//housecleaning
++	kv.mu.Lock()
++	delete(kv.outstanding, seq)
++	c <- &Op{}
++	kv.mu.Unlock()
+ 	return nil
+ }
+ 
+-func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+-	// Your code here.
+-
++func (kv *KVPaxos) Put(args *PutArgs, reply *PutReply) error {
++	seq, c := kv.seqChan()
++	proposedVal := Op{From: args.From, CSeq: args.SeqNum, PSeq: seq, 
++		Proposer: kv.me, Type: args.Op, Key: args.Key, Value: args.Value}
++	kv.px.Start(seq, proposedVal)
++	acceptedVal := <- c
++	//retry if it wasn't what we proposed
++	if acceptedVal.From != args.From  || acceptedVal.CSeq != args.SeqNum {
++		reply.Err = Err(ErrPut)
++		//housecleaning
++		kv.mu.Lock()
++		delete(kv.outstanding, seq)
++		c <- &Op{}
++		kv.mu.Unlock()
++		return nil
++	}
++	
++	reply.Err = acceptedVal.Err
++	
++	//housecleaning
++	kv.mu.Lock()
++	delete(kv.outstanding, seq)
++	c <- &Op{}
++	kv.mu.Unlock()
+ 	return nil
+ }
+ 
++func (kv *KVPaxos) seqChan() (int, chan *Op) {
++	kv.mu.Lock()
++	seq := kv.px.Max() + 1
++	for _,ok := kv.outstanding[seq]; ok || kv.highestApplied >= seq; {
++		seq++
++		_,ok = kv.outstanding[seq]
++	}
++	c := make(chan *Op)
++	kv.outstanding[seq] = c
++	kv.mu.Unlock()
++	return seq,c
++}
++
++func (kv *KVPaxos) duplicateCheck(from string, CSeq int) (bool, *Op) {
++	//check responses map
++	if duplicate, ok := kv.responses[from]; ok {
++		if duplicate.CSeq == CSeq {
++			return true, duplicate
++		} else if CSeq < duplicate.CSeq {
++			return true, &Op{From:Nobody}
++		}
++	}
++	return false, &Op{}
++}
++
++func (kv *KVPaxos) getStatus() {
++	seq := 0
++	restarted := false
++	//TA suggests 10-20ms max before proposing noop
++	to := 10 * time.Millisecond
++	for !kv.isdead() {
++		decided, r := kv.px.Status(seq)
++		
++		if decided == paxos.Decided  {
++			//add to log and notify channels
++			op, isOp := r.(Op)
++			if isOp {
++				kv.mu.Lock()
++				if op.From != Nobody {
++					kv.apply(seq, &op)
++				} else {
++					kv.highestApplied = seq
++					kv.px.Done(seq)
++				}
++				if ch, ok := kv.outstanding[seq]; ok {
++					ch <- &op //notify handler 
++					kv.mu.Unlock()
++					<- ch
++				} else {
++					kv.mu.Unlock()
++				}
++			} else {
++				log.Fatal("Fatal!could not cast Op");
++			}
++			seq++
++			restarted = false
++		} else {
++			time.Sleep(to)
++			if to < 25 * time.Millisecond {
++				to *= 2
++			} else { //if we've slept long enough, propose a noop
++				if !restarted {
++					to = 10 * time.Millisecond
++					kv.px.Start(seq, Op{From: Nobody})
++					time.Sleep(time.Millisecond)
++					restarted = true
++				}
++			}
++		}
++	}
++}
++
++func (kv *KVPaxos) apply(seq int, op *Op) {
++	if dup, d := kv.duplicateCheck(op.From, op.CSeq); !dup {
++		prev_val := ""
++		switch op.Type {
++		case Put :
++			kv.db[op.Key] = prev_val + op.Value
++		case Append:
++			prev_val = kv.db[op.Key]
++			kv.db[op.Key] =  prev_val + op.Value
++		case Get:
++			if v, ok := kv.db[op.Key]; ok {		
++				op.Value = v
++			} else {
++				op.Err = Err(ErrNoKey)
++			}
++		}
++		kv.responses[op.From] = op
++	} else {
++		if d.From != Nobody {
++			//copy all the things
++			op.From = d.From
++			op.CSeq = d.CSeq
++			op.PSeq = d.PSeq
++			op.Proposer = d.Proposer
++			op.Type = d.Type
++			op.Key = d.Key
++			op.Value = d.Value
++			op.Err = d.Err
++		} else { //this is a very stale request
++			op.Err = Err(ErrGet)
++		}
++	}
++	kv.highestApplied = seq
++	kv.px.Done(seq)
++}
++
++//concatenates source and seq
++//func (kv *KVPaxos) makeID(source string, seq int) string {
++//	str := source + strconv.Itoa(seq)
++//	return str
++//}
++
+ // tell the server to shut itself down.
+-// please do not change these two functions.
++// please do not change this function.
+ func (kv *KVPaxos) kill() {
+ 	DPrintf("Kill(%d): die\n", kv.me)
+ 	atomic.StoreInt32(&kv.dead, 1)
+@@ -61,7 +235,6 @@ func (kv *KVPaxos) kill() {
+ 	kv.px.Kill()
+ }
+ 
+-// call this to find out if the server is dead.
+ func (kv *KVPaxos) isdead() bool {
+ 	return atomic.LoadInt32(&kv.dead) != 0
+ }
+@@ -84,61 +257,69 @@ func (kv *KVPaxos) isunreliable() bool {
+ // servers that will cooperate via Paxos to
+ // form the fault-tolerant key/value service.
+ // me is the index of the current server in servers[].
+-//
++// 
+ func StartServer(servers []string, me int) *KVPaxos {
+-	// call gob.Register on structures you want
+-	// Go's RPC library to marshall/unmarshall.
+-	gob.Register(Op{})
++  // call gob.Register on structures you want
++  // Go's RPC library to marshall/unmarshall.
++  gob.Register(Op{})
+ 
+-	kv := new(KVPaxos)
+-	kv.me = me
++  kv := new(KVPaxos)
++  kv.me = me
+ 
+-	// Your initialization code here.
++  // Your initialization code here.
++  kv.db = make(map[string]string)
++  kv.log = make(map[int]*Op)
++  kv.responses = make(map[string]*Op)
++  kv.outstanding = make(map[int]chan *Op)
++  kv.highestApplied = -1
+ 
+-	rpcs := rpc.NewServer()
+-	rpcs.Register(kv)
++  rpcs := rpc.NewServer()
++  rpcs.Register(kv)
+ 
+-	kv.px = paxos.Make(servers, me, rpcs)
++  kv.px = paxos.Make(servers, me, rpcs)
+ 
+-	os.Remove(servers[me])
+-	l, e := net.Listen("unix", servers[me])
+-	if e != nil {
+-		log.Fatal("listen error: ", e)
+-	}
+-	kv.l = l
+-
+-
+-	// please do not change any of the following code,
+-	// or do anything to subvert it.
+-
+-	go func() {
+-		for kv.isdead() == false {
+-			conn, err := kv.l.Accept()
+-			if err == nil && kv.isdead() == false {
+-				if kv.isunreliable() && (rand.Int63()%1000) < 100 {
+-					// discard the request.
+-					conn.Close()
+-				} else if kv.isunreliable() && (rand.Int63()%1000) < 200 {
+-					// process the request but force discard of reply.
+-					c1 := conn.(*net.UnixConn)
+-					f, _ := c1.File()
+-					err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+-					if err != nil {
+-						fmt.Printf("shutdown: %v\n", err)
+-					}
+-					go rpcs.ServeConn(conn)
+-				} else {
+-					go rpcs.ServeConn(conn)
+-				}
+-			} else if err == nil {
+-				conn.Close()
+-			}
+-			if err != nil && kv.isdead() == false {
+-				fmt.Printf("KVPaxos(%v) accept: %v\n", me, err.Error())
+-				kv.kill()
+-			}
+-		}
+-	}()
++  os.Remove(servers[me])
++  l, e := net.Listen("unix", servers[me]);
++  if e != nil {
++    log.Fatal("listen error: ", e);
++  }
++  kv.l = l
++
++
++  // please do not change any of the following code,
++  // or do anything to subvert it.
+ 
+-	return kv
++  go func() {
++    for kv.isdead() == false {
++      conn, err := kv.l.Accept()
++      if err == nil && kv.isdead() == false {
++        if kv.isunreliable() && (rand.Int63() % 1000) < 100 {
++          // discard the request.
++          conn.Close()
++        } else if kv.isunreliable() && (rand.Int63() % 1000) < 200 {
++          // process the request but force discard of reply.
++          c1 := conn.(*net.UnixConn)
++          f, _ := c1.File()
++          err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
++          if err != nil {
++            fmt.Printf("shutdown: %v\n", err)
++          }
++          go rpcs.ServeConn(conn)
++        } else {
++          go rpcs.ServeConn(conn)
++        }
++      } else if err == nil {
++        conn.Close()
++      }
++      if err != nil && kv.isdead() == false {
++        fmt.Printf("KVPaxos(%v) accept: %v\n", me, err.Error())
++        kv.kill()
++      }
++    }
++  }()
++
++  //this goroutine starts a thread to monitor paxos
++  go kv.getStatus()	
++  return kv
+ }
++
+diff --git a/src/paxos/paxos.go b/src/paxos/paxos.go
+index cfeeceb..d6b2b4b 100644
+--- a/src/paxos/paxos.go
++++ b/src/paxos/paxos.go
+@@ -14,115 +14,209 @@ package paxos
+ //
+ // px = paxos.Make(peers []string, me string)
+ // px.Start(seq int, v interface{}) -- start agreement on new instance
+-// px.Status(seq int) (Fate, v interface{}) -- get info about an instance
++// px.Status(seq int) (decided bool, v interface{}) -- get info about an instance
+ // px.Done(seq int) -- ok to forget all instances <= seq
+ // px.Max() int -- highest instance seq known, or -1
+ // px.Min() int -- instances before this seq have been forgotten
+ //
+ 
++/*
++Library implementing the Paxos protocol and managing a set of agreed upon values. Each
++kvpaxos server will have an instance of this library which allows it to start agreement
++negotiation about a new Paxos instance/run and retrieve the decision that was made. All 
++library calls are stubs which use RPC communication with other peers to send messages 
++back and forth and eventually reach agreements. To support systems that run for a long 
++time, the agreement map is cleaned up by removing entries that all kvpaxos servers have 
++indicated they will no longer need using the Done call.
++*/
++
+ import "net"
+ import "net/rpc"
+ import "log"
+-
+ import "os"
+ import "syscall"
+ import "sync"
+-import "sync/atomic"
++//import "runtime"
++import "time"
+ import "fmt"
++//import "math"
+ import "math/rand"
++import "sync/atomic"
++
++
++type Paxos struct {
++  mu sync.Mutex
++  l net.Listener
++  dead int32
++  unreliable int32
++  rpcCount int32
++  peers []string
++  me int                         // index into peers[]
++  peer_count int                 // Number of Paxos Peers
++  state map[int]*AgreementState  // Key: Agreement instance number -> Value: Agreement State
++  done map[string]int            // Key: Server name, Value: The most recently received value for that server's highest done value.
++}
++
+ 
+ 
+-// px.Status() return values, indicating
+-// whether an agreement has been decided,
+-// or Paxos has not yet reached agreement,
+-// or it was agreed but forgotten (i.e. < Min()).
+ type Fate int
+ 
+ const (
+-	Decided   Fate = iota + 1
+-	Pending        // not yet decided.
+-	Forgotten      // decided but forgotten.
++  Decided   Fate = iota + 1
++  Pending        // not yet decided.
++  Forgotten      // decided but forgotten.
+ )
+ 
+-type Paxos struct {
+-	mu         sync.Mutex
+-	l          net.Listener
+-	dead       int32 // for testing
+-	unreliable int32 // for testing
+-	rpcCount   int32 // for testing
+-	peers      []string
+-	me         int // index into peers[]
++type Proposal struct {
++  Number int               // proposal number (unqiue per Argeement instance)
++  Value interface{}        // value of the Proposal
++}
+ 
++type PrepareArgs struct {
++  Agreement_number int        // number of the agreement instance
++  Proposal_number int         // proposal number of the proposal
++}
+ 
+-	// Your data here.
++
++type PrepareReply struct {
++  Prepare_ok bool             // was prepare ok'ed?
++  Number_promised int         // promise not to accept any more proposals less than n
++  Accepted_proposal *Proposal // highest numbered proposal that has been accepted
+ }
+ 
+-//
+-// call() sends an RPC to the rpcname handler on server srv
+-// with arguments args, waits for the reply, and leaves the
+-// reply in reply. the reply argument should be a pointer
+-// to a reply structure.
+-//
+-// the return value is true if the server responded, and false
+-// if call() was not able to contact the server. in particular,
+-// the replys contents are only valid if call() returned true.
+-//
+-// you should assume that call() will time out and return an
+-// error after a while if it does not get a reply from the server.
+-//
+-// please use call() to send all RPCs, in client.go and server.go.
+-// please do not change this function.
+-//
+-func call(srv string, name string, args interface{}, reply interface{}) bool {
+-	c, err := rpc.Dial("unix", srv)
+-	if err != nil {
+-		err1 := err.(*net.OpError)
+-		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
+-			fmt.Printf("paxos Dial() failed: %v\n", err1)
+-		}
+-		return false
+-	}
+-	defer c.Close()
+ 
+-	err = c.Call(name, args, reply)
+-	if err == nil {
+-		return true
+-	}
++type AcceptArgs struct {
++  Agreement_number int        // number of the agreement instance
++  Proposal *Proposal          // Proposal to contend to be the decided proposal
++}
++
+ 
+-	fmt.Println(err)
+-	return false
++type AcceptReply struct {
++  Accept_ok bool              // whether the accept proposal request was accepted
++  Highest_done int            // sender's highest "done" argument number
+ }
+ 
++type DecidedArgs struct {
++  Agreement_number int        // number of the agreement instance
++  Proposal *Proposal          // Proposal containing the decided upon value
++}
++
++type DecidedReply struct {
+ 
+-//
+-// the application wants paxos to start agreement on
+-// instance seq, with proposed value v.
+-// Start() returns right away; the application will
+-// call Status() to find out if/when agreement
+-// is reached.
+-//
+-func (px *Paxos) Start(seq int, v interface{}) {
+-	// Your code here.
+ }
+ 
+-//
+-// the application on this machine is done with
+-// all instances <= seq.
+-//
+-// see the comments for Min() for more explanation.
+-//
+-func (px *Paxos) Done(seq int) {
+-	// Your code here.
++type AgreementState struct {
++  decided bool
++  // Proposer
++  proposal_number int           // Proposal number propser is using currently.
++  // Acceptor
++  highest_promised int          // highest proposal number promised in a prepare_ok reply
++  accepted_proposal *Proposal   // highest numbered proposal that has been accepted
+ }
+ 
+-//
+-// the application wants to know the
+-// highest instance sequence known to
+-// this peer.
+-//
++/*
++Sets the value for the highest_promised field of an AgreementState instance
++Caller is responsible for attaining a lock on the AgreementState in some way
++before calling.
++*/
++func (agrst *AgreementState) set_highest_promised(new_highest_promised int) {
++  agrst.highest_promised = new_highest_promised
++}
++
++/*
++Sets the value for the accepted_proposal field of an AgreementState instance
++Caller is responsible for attaining a lock on the AgreementState in some way
++before calling.
++*/
++func (agrst *AgreementState) set_accepted_proposal(proposal *Proposal) {
++  agrst.accepted_proposal = proposal
++}
++
++/*
++Sets the value for the proposal_number field of the AgreementState instance
++Caller is responsible for attaining a lock of the AgreementState in some way
++before calling.
++*/
++func (agrst *AgreementState) set_proposal_number(number int) {
++  agrst.proposal_number = number
++}
++
++/*
++Sets the value for the decided field of the AgreementState instance
++Caller is responsible for attaining a lock of the AgreementState in some way
++before calling.
++*/
++func (agrst *AgreementState) set_decided(decided bool) {
++  agrst.decided = decided
++}
++
++
++/*
++The application wants paxos to start agreement instance with agreement_number and 
++proposed value 'value'. Only agreement_numbers which the Paxos peers have not decided
++to free from memory (i.e. above the minimum_done agreement which has been freed) are 
++allowed.
++If AgreementState for agreement_number not already created (by another proposer calling
++Prepare_handler), it is initialized. 
++Spawns a thread to act as the proposer to drive the agreement instance to a decision 
++while the main thread handing the request returns right away.
++The application will call Status() to find out if/when agreement is reached.
++*/
++func (px *Paxos) Start(agreement_number int, proposal_value interface{}) {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  if agreement_number <= px.minimum_done_number() {
++    return              // peers decided to free this agreement instance from memory
++  }
++  _, present := px.state[agreement_number]
++  if !present {
++    px.state[agreement_number] = px.make_default_agreementstate()
++  }
++  //fmt.Printf("Paxos Start (%s): agreement_number: %d, proposal_value: %v\n", short_name(px.peers[px.me], 7), agreement_number, proposal_value)
++
++  // Spawn a thread to construct proposal and act as the proposer
++  go px.proposer_role(agreement_number, proposal_value)
++
++  return
++}
++
++/*
++A client application of the Paxos library will call this method when it no longer
++needs to call px.Status() for a particular agreement number. 
++All replica servers keep track of Done calls they have received since any entries in
++the px.state table for agreement instances below the minimum Done call agreement_number
++can be deleted since all replica servers have indicated they no longer need to retrieve
++the decision that was made for that agreement instance. 
++Client replica server is done with all instances <= agreement_number.
++*/
++func (px *Paxos) Done(agreement_number int) {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++  // Update record of highest agreement_number marked done by the Paxos client.
++  if agreement_number > px.done[px.peers[px.me]] {
++    px.done[px.peers[px.me]] = agreement_number
++  }
++  //fmt.Printf("Paxos Done (%s): client_said: %d, my_h_done: %d\n", short_name(px.peers[px.me], 7), agreement_number, px.done[px.peers[px.me]])
++}
++
++
++/* 
++Client wants the highest agreement instance number known to this peer. 
++Returns -1 if no agreement instances are known (i.e. no AgreementState entries 
++have been added to the px.state map)
++*/
+ func (px *Paxos) Max() int {
+-	// Your code here.
+-	return 0
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  max_agreement_instance_number := -1
++  for agreement_number, _ := range px.state {
++    if agreement_number > max_agreement_instance_number {
++      max_agreement_instance_number = agreement_number
++    }
++  }
++  return max_agreement_instance_number
+ }
+ 
+ //
+@@ -136,6 +230,9 @@ func (px *Paxos) Max() int {
+ // The point is to free up memory in long-running
+ // Paxos-based servers.
+ //
++// It is illegal to call Done(i) on a peer and
++// then call Start(j) on that peer for any j <= i.
++//
+ // Paxos peers need to exchange their highest Done()
+ // arguments in order to implement Min(). These
+ // exchanges can be piggybacked on ordinary Paxos
+@@ -152,122 +249,761 @@ func (px *Paxos) Max() int {
+ // life, it will need to catch up on instances that it
+ // missed -- the other peers therefor cannot forget these
+ // instances.
+-//
++// 
+ func (px *Paxos) Min() int {
+-	// You code here.
+-	return 0
++  px.mu.Lock()
++  defer px.mu.Unlock()
++  // Minimum agreement_number whose agreementstate is still maintained in px.state
++  return px.minimum_done_number() + 1
++}
++
++/* The application wants to know whether this peer thinks an Agreement 
++instance has been decided upon, and if so what the agreed value is.
++Status() should just inspect the local peers AgreementState; it should not contact 
++other Paxos peers.
++If an agreement was reached, but all replica server clients of Paxos instances 
++indicated they no longer needed the decided result, the result was deleted and 
++false should be returned.
++*/
++func (px *Paxos) Status(agreement_number int) (Fate, interface{}) {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  if agreement_number <= px.minimum_done_number() {
++    return Forgotten, nil   // Paxos clients all said ok to delete agreement result.
++  }
++  _, present := px.state[agreement_number]
++  if present && px.state[agreement_number].decided {
++    return Decided, px.state[agreement_number].accepted_proposal.Value
++  } 
++  return Pending, nil
++}
++
++
++/*
++Paxos Proposer role drives an agreement instance to a decision/agreement. Should be
++started as a separate thread.
++Acts in the Paxos proposer role to first propose a proposal to the acceptors for 
++agreement instance 'agreement_number' and if a majority reply with prepare_ok then
++the proposer proceeds to phase 2. 
++In phase 2, it sends an accept request to each of the Paxos peers with the proposal
++that was sent in the prepare requests. If a majority of peers accept the proposal
++then a decision has been made and Decided messages are broadcast to all peers. 
++  If a majority was not reached during the prepare phase or the accept phase, execution
++loops back the beginning of the proposer_role and a new (higher, but still unique)
++proposal number is chosen and new proposal with this number created. The only ways
++execution can leave the proposer role without this proposed_role thread making a 
++decision is if 
++* px.still_deciding returns false (indicating a competing proposer role caused a 
++decision to be made)
++* px.dead is true indicating that the test suite has marked the server as dead and 
++thread execution should stop.
++*/
++func (px *Paxos) proposer_role(agreement_number int, proposal_value interface{}) {
++  var done_proposing = false
++  var majority_prepare bool
++  var high_val_found bool
++  var highest_number = -1
++  var high_val interface{}
++  
++  for !done_proposing && px.still_deciding(agreement_number) && !px.isdead() {
++    
++    // Generate the next number that is larger than highest_number
++    proposal_number := px.next_proposal_number(agreement_number, highest_number)
++
++    // Broadcast prepare request for agreement instance 'agreement_number' to Paxos acceptors.
++    //fmt.Printf("Proposer [PrepareStage] (%s): agree_num: %d, prop: %d, val: %v\n", short_name(px.peers[px.me], 7), agreement_number, proposal_number, proposal_value)
++    var proposal = &Proposal{Number: proposal_number, Value: proposal_value}
++    replies_from_prepare := px.broadcast_prepare(agreement_number, proposal)
++
++    majority_prepare, highest_number, high_val_found, high_val = px.evaluate_prepare_replies(replies_from_prepare)
++
++    if !majority_prepare || !px.still_deciding(agreement_number) {
++      //fmt.Printf("Proposer [PrepareStage] (%s): agree_num: %d, prop: %d, Majority not reached on prepare\n", short_name(px.peers[px.me], 7), agreement_number, proposal_number)    
++      //runtime.Gosched()
++      time.Sleep(time.Duration(rand.Intn(100)))
++      continue
++    }
++
++    if high_val_found {
++      // Accept request should have value v, where v is the value of highest-number among prepare replies
++      proposal.Value = high_val
++    }
++    // Otherwise, the value may be kept at what the application calling px.Start requested.
++    //fmt.Printf("Proposer [AcceptStage] (%s): agree_num: %d, prop: %d, val: %v\n", short_name(px.peers[px.me], 7), agreement_number, proposal_number, proposal.Value)
++    replies_from_accept := px.broadcast_accept(agreement_number, proposal)
++    majority_accept := px.evaluate_accept_replies(replies_from_accept)
++
++    if majority_accept {
++      // Broadcast decides
++      //fmt.Printf("Proposer [DecisionReached] (%s): agree_num: %d, prop: %d, val: %v\n", short_name(px.peers[px.me], 7), agreement_number, proposal_number, proposal.Value)
++      px.broadcast_decided(agreement_number, proposal)
++      done_proposing = true
++    } else {
++      //fmt.Printf("Proposer [AcceptStage] (%s): agree_num: %d, Majority not reached on accept\n", short_name(px.peers[px.me], 7), agreement_number)    
++      //runtime.Gosched()
++      time.Sleep(time.Duration(rand.Intn(100)))
++      continue
++    }
++
++  // End of proposing loop  
++  }
++}
++
++
++/*
++Paxos library instances communicate with one another via exported RPC methods.
++Accepts pointers to PrepageArgs and PrepareReply. Method will populate the PrepareReply
++and return any errors.
++*/
++func (px *Paxos) Prepare_handler(args *PrepareArgs, reply *PrepareReply) error {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++  var agreement_number = args.Agreement_number
++  var proposal_number = args.Proposal_number
++
++  _, present := px.state[agreement_number]
++  if present {
++    // continue accepting prepare requests
++  } else {
++    if !present && agreement_number > px.minimum_done_number() {
++      // First hearing of agreement instance from some proposer
++      px.state[agreement_number] = px.make_default_agreementstate()
++    } else {
++      //fmt.Println("Trying to prepare agreement that should not exist Error!!!")
++      px.state[agreement_number] = px.make_default_agreementstate()
++    }
++  }
++
++  if proposal_number > px.state[agreement_number].highest_promised {
++    // Promise not to accept proposals numbered less than n
++    px.state[agreement_number].set_highest_promised(proposal_number)
++    reply.Prepare_ok = true
++    reply.Number_promised = proposal_number
++    reply.Accepted_proposal = px.state[agreement_number].accepted_proposal
++    //fmt.Printf("Prepare_ok (%s): agreement_number: %d, proposal: %v\n", short_name(px.peers[px.me], 7), args.Agreement_number, reply.Accepted_proposal)
++    return nil
++  }
++  reply.Prepare_ok = false
++  reply.Number_promised = px.state[agreement_number].highest_promised
++  reply.Accepted_proposal = px.state[agreement_number].accepted_proposal
++  //fmt.Printf("Prepare_no (%s): agreement_number: %d, proposal: %v\n", short_name(px.peers[px.me], 7), args.Agreement_number, reply.Accepted_proposal)
++  return nil
++}
++
++
++/*
++Paxos library instances communicate with one another via exported RPC methods.
++Accepts pointers to PrepageArgs and PrepareReply. Method will populate the PrepareReply
++and return any errors.
++*/
++func (px *Paxos) Accept_handler(args *AcceptArgs, reply *AcceptReply) error {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  var agreement_number = args.Agreement_number
++  var proposal = args.Proposal
++
++  _, present := px.state[agreement_number]
++  if present {
++    // continue accepting prepare requests
++  } else {
++    if !present && agreement_number > px.minimum_done_number() {
++      // First hearing of agreement instance from some proposer
++      px.state[agreement_number] = px.make_default_agreementstate()
++    } else {
++      //fmt.Println("Trying to accept agreement that should not exist Error!!!")
++      px.state[agreement_number] = px.make_default_agreementstate()
++    }
++  }
++
++  if proposal.Number >= px.state[agreement_number].highest_promised {
++    px.state[agreement_number].set_highest_promised(proposal.Number)
++    px.state[agreement_number].set_accepted_proposal(proposal)
++    reply.Accept_ok = true
++    reply.Highest_done = px.done[px.peers[px.me]]
++    //fmt.Printf("Accept_ok (%s): agree_num: %d, prop: %d, val: %v, h_done: %d\n", short_name(px.peers[px.me], 7), args.Agreement_number, args.Proposal.Number, proposal.Value, reply.Highest_done)
++    return nil
++  }
++  reply.Accept_ok = false
++  reply.Highest_done = px.done[px.peers[px.me]]
++  //fmt.Printf("Accept_no (%s): agree_num: %d, prop: %d, h_done: %d\n", short_name(px.peers[px.me], 7), args.Agreement_number, args.Proposal.Number, reply.Highest_done)
++  return nil
++}
++
++
++/*
++Paxos library instances communicate with one another via exported RPC methods.
++Accepts pointers to DecidedArgs and DecidedReply. Method will populate the DecidedReply
++and return any errors.
++*/
++func (px *Paxos) Decided_handler(args *DecidedArgs, reply *DecidedReply) error {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  var agreement_number = args.Agreement_number
++  var proposal = args.Proposal
++
++  _, present := px.state[agreement_number]
++  if !present {
++    //fmt.Println("AgreementState should exist in DecidedHandler!!!")
++    px.state[agreement_number] = px.make_default_agreementstate()
++  } 
++  // A leaner never learns that a value has been chosen unless it actually has been.
++  px.state[agreement_number].set_decided(true)
++  px.state[agreement_number].set_accepted_proposal(proposal)
++  //fmt.Printf("Decided (%s): agree_num: %d, prop: %d, val: %v\n", short_name(px.peers[px.me], 7), args.Agreement_number, args.Proposal.Number, args.Proposal.Value)
++  return nil
++}
++
++/*
++Returns a reference to an AgreementState instance initialized with the correct default
++values so that it is ready to be used in the px.state map.
++The highest seen and highest promised are set to -1 and the proposal number is set to
++the px.me index minux the number of peers since each time next_proposal_number is 
++called, the number is incremented by the number of peers.
++*/
++func (px *Paxos) make_default_agreementstate() *AgreementState {
++  initial_proposal_number := px.me - px.peer_count
++  agrst := AgreementState{highest_promised: -1,
++                          decided: false,
++                          proposal_number: initial_proposal_number} 
++  return &agrst
++}
++
++/*
++Accepts the number of affirmative/ok replies from acceptors.
++Returns a boolean indicating whether that is a majority of the pool of peer 
++Paxos instances.
++*/
++func (px *Paxos) is_majority(ok_reply_count int) bool {
++  if ok_reply_count <= (px.peer_count / 2) {
++    return false
++  }
++  return true
++}
++
++/*
++To guarantee unique proposal numbers, the proposal number is initialized with the index 
++of the Paxos instance minus the number of peer Paxos servers. On each call, the 
++proposal number is incremented by the number of Paxos peers. This ensures that proposal
++numbers used by Paxos peers are unique across the peer set and increasing.
++Even if Start is called more than once, notice that the number to use is stored
++for each paxos peer for each agreement state, meaning that even those instances will
++have unique numbers - the proposal_number in agreement state is updated atomically
++because of the lock taken out.
++The highest_promised parameter is the highest promised number the proposer has seen 
++so continue generating numbers as described above until one it found that is 
++LARGER than highest_promised so the next prepare request has a chance of succeeding.
++Note that the lock is kinda too coarse since we really
++only need to lock a specific AgreementState, but this is fine.
++*/
++func (px *Paxos) next_proposal_number(agreement_number int, highest_promised int) int {
++  // Formally only need to lock a specific AgreementState
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  //fmt.Printf("next_proposal state access (%s): %d, %v\n", short_name(px.peers[px.me], 7), agreement_number, px.state)
++  current_proposal_number := px.state[agreement_number].proposal_number
++  next_proposal_number := current_proposal_number + px.peer_count
++  px.state[agreement_number].set_proposal_number(next_proposal_number)
++
++  // for next_proposal_number <= highest_promised {
++  //   // Repeat until a high enough proposal number is found.
++  //   current_proposal_number := px.state[agreement_number].proposal_number
++  //   next_proposal_number := current_proposal_number + px.peer_count
++  //   px.state[agreement_number].set_proposal_number(next_proposal_number)
++  // }
++  // Multiplier is how many times px.peer_count should be added to increment proposal number
++  //multiplier := (highest_promised - current_proposal_number)/
++
++  return next_proposal_number
++}
++
++
++/*
++Returns a boolean of whether an agreement instance is still in the process of being
++decided, indicating that a proposer should continue trying to reach a decision.
++*/
++func (px *Paxos) still_deciding(agreement_number int) bool {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  if agreement_number <= px.minimum_done_number() {
++    return false        // Already decided and agreement instance memory freed
++  }
++  _, present := px.state[agreement_number]
++  if present {
++    if px.state[agreement_number].decided {
++      return false     // already decided
++    } else {
++      return true      // agreement state is maintained, but no decision yet.
++    }
++  }
++  return false        // agreement instance is not maintained on paxos instance
++}
++
++
++/*
++Accepts an agreement instance agreement_number and a reference to a Proposal that should
++be broadcast in a prepare request to all Paxos acceptors. Collects and returns a list 
++of PrepareReply elements.
++Does NOT mutate local px instance or take out any locks.
++*/
++func (px *Paxos) broadcast_prepare(agreement_number int, proposal *Proposal) []PrepareReply {
++  
++  var replies_array = make([]PrepareReply, px.peer_count)    // declare and init
++  for index, peer := range px.peers {
++    if peer == px.peers[px.me] {
++      // local_prepare can be used instead of RPC
++      replies_array[index] = *(px.local_prepare(agreement_number, proposal.Number))
++      continue
++    }
++    args := &PrepareArgs{}       // declare and init struct with zero-valued fields. 
++    args.Agreement_number = agreement_number
++    args.Proposal_number = proposal.Number
++    var reply PrepareReply       // declare reply so ready to be modified by callee
++    // Attempt to contact peer. No reply is equivalent to a vote no.
++    call(peer, "Paxos.Prepare_handler", args, &reply)
++    replies_array[index] = reply
++  }
++  return replies_array
++}
++
++/*
++Accepts an agreement instance agreement_number and a reference to a Proposal that should
++be broadcast in an accept request to all Paxos acceptors. Collects and returns a list 
++of AcceptReply elements.
++Does NOT mutate local px instance or take out any locks.
++*/
++func (px *Paxos) broadcast_accept(agreement_number int, proposal *Proposal) []AcceptReply {
++  
++  var replies_array = make([]AcceptReply, px.peer_count)   // declare and init
++  for index, peer := range px.peers {
++    if peer == px.peers[px.me] {
++      // local_accept can be used instead of RPC
++      replies_array[index] = *(px.local_accept(agreement_number, proposal))
++      continue                
++    }
++    args := &AcceptArgs{}       // declare and init struct with zero-valued fields. 
++    args.Agreement_number = agreement_number
++    args.Proposal = proposal
++    var reply AcceptReply       // declare reply so ready to be modified by callee
++    // Attempt to contact peer. No reply is equivalent to a vote no.
++    call(peer, "Paxos.Accept_handler", args, &reply)
++    replies_array[index] = reply
++    px.update_done_entry(peer, reply.Highest_done)
++  }
++  return replies_array
++}
++
++/*
++Accepts an agreement instance agreement_number and a reference to a Proposal that should
++be broadcast in a decided request to all Paxos learners.
++Does NOT mutate local px instance or take out any locks.
++*/
++func (px *Paxos) broadcast_decided(agreement_number int, proposal *Proposal) {
++  for _, peer := range px.peers {
++    if peer == px.peers[px.me] {
++      // local_decided can be used instead of RPC
++      px.local_decided(agreement_number, proposal)
++      continue                   // local_decided should be used instead of RPC
++    }
++    args := &DecidedArgs{}       // declare and init struct with zero-valued fields. 
++    args.Agreement_number = agreement_number
++    args.Proposal = proposal
++    var reply DecidedReply       // declare reply so ready to be modified by callee
++    // Attempt to contact peer. No reply is equivalent to a vote no.
++    call(peer, "Paxos.Decided_handler", args, &reply)
++  }
++  return
++}
++
++
++/*
++Simulates the actions of receiving a prepare RPC request but this method is called
++locally as a function. Accepts agreement_number and proposal_number, the values that 
++would be packaged inside PrepareArgs. 
++Returns a pointer to an PrepareReply so all the replies (both local & RPC) can be 
++evaluated together.
++Since it simulates the Prepare_handler, it takes out a lock on the current Paxos
++instance.
++*/
++func (px *Paxos) local_prepare(agreement_number int, proposal_number int) *PrepareReply {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++  var reply PrepareReply
++
++  _, present := px.state[agreement_number]
++  if present {
++    // continue accepting prepare requests
++  } else {
++    if !present && agreement_number > px.minimum_done_number() {
++      // First hearing of agreement instance from some proposer
++      px.state[agreement_number] = px.make_default_agreementstate()
++    } else {
++      //fmt.Println("Trying to prepare agreement that should not exist Error!!!")
++      px.state[agreement_number] = px.make_default_agreementstate()
++    }
++  }
++
++  if proposal_number > px.state[agreement_number].highest_promised {
++    // Promise not to accept proposals numbered less than n
++    px.state[agreement_number].set_highest_promised(proposal_number)
++    reply.Prepare_ok = true
++    reply.Number_promised = proposal_number
++    reply.Accepted_proposal = px.state[agreement_number].accepted_proposal
++    //fmt.Printf("Prepare_ok (%s): agreement_number: %d, proposal: %v\n", short_name(px.peers[px.me], 7), agreement_number, reply.Accepted_proposal)
++    return &reply
++  }
++  reply.Prepare_ok = false
++  reply.Number_promised = px.state[agreement_number].highest_promised
++  reply.Accepted_proposal = px.state[agreement_number].accepted_proposal
++  //fmt.Printf("Prepare_no (%s): agreement_number: %d, proposal: %v\n", short_name(px.peers[px.me], 7), agreement_number, reply.Accepted_proposal)
++  
++  return &reply
++}
++
++
++
++/*
++Simulates the actions of receiving an accept RPC request but this method is called
++locally as a function. Accepts agreement_number and proposal, the values that would
++be packaged inside AcceptArgs. 
++Returns a pointer to an AcceptReply so all the replies (both local & RPC) can be 
++evaluated together.
++Since it simulates the Accept_handler, it takes out a lock on the current Paxos
++instance.
++*/
++func (px *Paxos) local_accept(agreement_number int, proposal *Proposal) *AcceptReply {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++  var reply AcceptReply
++
++  _, present := px.state[agreement_number]
++  if !present {
++    //fmt.Println("AgreementState should exist in local_accept!!!")
++    px.state[agreement_number] = px.make_default_agreementstate()
++  } 
++
++  if proposal.Number >= px.state[agreement_number].highest_promised {
++    px.state[agreement_number].set_highest_promised(proposal.Number)
++    px.state[agreement_number].set_accepted_proposal(proposal)
++    reply.Accept_ok = true
++    reply.Highest_done = px.done[px.peers[px.me]]
++    //fmt.Printf("Accept_ok (%s): agree_num: %d, prop: %d, val: %v, h_done: %d\n", short_name(px.peers[px.me], 7), agreement_number, proposal.Number, proposal.Value, reply.Highest_done)
++    return &reply
++  }
++  reply.Accept_ok = false
++  reply.Highest_done = px.done[px.peers[px.me]]
++  //fmt.Printf("Accept_no (%s): agree_num: %d, prop: %d, h_done: %d\n", short_name(px.peers[px.me], 7), agreement_number, proposal.Number, reply.Highest_done)
++  return &reply
++}
++
++
++/*
++Marks the agreement instance agreement_number as decided and sets the accepted 
++proposal. This method is needed because the deaf proposer prohibits a proposer
++from receiving RPC calls, in which case we must both broadcast decisions and 
++update the local paxos instance.
++*/
++func (px *Paxos) local_decided(agreement_number int, proposal *Proposal) {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++
++  _, present := px.state[agreement_number]
++  if !present {
++    //fmt.Println("AgreementState should exist in local_decided!!!")
++    px.state[agreement_number] = px.make_default_agreementstate()
++  } 
++  // A leaner never learns that a value has been chosen unless it actually has been.
++  px.state[agreement_number].set_decided(true)
++  px.state[agreement_number].set_accepted_proposal(proposal)
++}
++
++
++
++/*
++Accepts a peer string and the latest received highest done agreement number from
++the acceptor. Check that this number is higher than the current highest done value 
++stored in px.done for that server and if it is, update the px.done mapping
++We technically only need to lock px.done, but locking the paxos instance is fine.
++*/
++func (px *Paxos) update_done_entry(paxos_peer string, highest_done int) {
++  px.mu.Lock()
++  defer px.mu.Unlock()
++  
++  if highest_done > px.done[paxos_peer] {
++    px.done[paxos_peer] = highest_done
++    //fmt.Printf("Update done (%s): Updated %s's h_done to %d\n", short_name(px.peers[px.me],7), short_name(paxos_peer,7), highest_done)
++    px.attempt_free_state()
++  }
++}
++
++/*
++Computes the minimum agreement number marked as done among all the done agreement 
++numbers reported back by peers and represented in the px.peers map.
++Callee is responsible for taking out a lock on the paxos instance.
++*/
++func (px *Paxos) minimum_done_number() int {
++  var min_done_number = px.done[px.peers[px.me]]
++  for _, peers_done_number := range px.done {
++    if peers_done_number < min_done_number {
++      min_done_number = peers_done_number
++    }
++  }
++  return min_done_number
++}
++
++/*
++Computes the minimum agreement number in the values of px.done which indicates that
++all Paxos peers have been told by their client server that all prior agreement states
++are no longer needed. Thus, this Paxos instance may delete state corresponding to
++agreements at or before the minimum agreement number in px.done.
++Callee is reponsible for attaining a lock on the px.state map and px.done map.
++*/
++func (px *Paxos) attempt_free_state() {
++  
++  var min_done_number = px.minimum_done_number()
++
++  //fmt.Printf("Free state (%s): min_done_val: %d\n", short_name(px.peers[px.me],7), min_done_number)
++  for agreement_number, _ := range px.state {
++    if agreement_number < min_done_number {
++      //fmt.Println("DELETE", agreement_number, short_name(px.peers[px.me], 7))
++      delete(px.state, agreement_number)
++    }
++  }
++
++}
++
++
++
++/*
++Evaluates the replies sent back by Paxos acceptors in response to prepare requests
++and checks to see if a majority of them were prepare_ok responses. Also compares all
++of the 'Accepted_proposal' fields in replies (representing the highest numbered 
++proposal the acceptor has accepted) and determines among these the highest numbered
++proposal -> the value of this proposal should be used in the subsequent accept
++requests.
++Returns bool of whether a majority was reached or not, a boolean indicating whether
++a highest accepted proposal was reported back by any acceptors, and the value from the highest
++numbered proposal reported by any acceptor in a reply to a prepare request. If no 
++highest accepted proposal was reported back, the reported highest_value is simply
++an empty interface instance.
++Does NOT mutate local px instance or take out any locks.
++*/
++func (px *Paxos) evaluate_prepare_replies(replies_array []PrepareReply) (bool, int, bool, interface{}){
++  var ok_count = 0                  // number replies with prepare_ok = true
++  var highest_number = -1           // highest number observed among replies Number_promised
++  var highest_proposal *Proposal    // highest numbered proposal reported as accepted by a peer, in a reply
++  
++  for _, reply := range replies_array {
++    if reply.Prepare_ok {
++      ok_count += 1
++    }
++    if reply.Number_promised > highest_number {
++      highest_number = reply.Number_promised
++    }
++    /*Note, reply did not need to be prepare_ok for us to use the value in the highest
++    numbered proposal an acceptor reports to have accepted*/
++    if reply.Accepted_proposal != nil {
++      if highest_proposal == nil {
++        // No reply has yet reported a highest proposal accepted
++        highest_proposal = reply.Accepted_proposal
++      } else if reply.Accepted_proposal.Number > highest_proposal.Number {
++        highest_proposal = reply.Accepted_proposal
++      }
++    }
++    // Otherwise, Acceptor has not accepted a proposal.
++  }
++
++  if highest_proposal == nil {
++    // No reply reported a highest accepted proposal
++    return px.is_majority(ok_count), highest_number, false, nil
++  }
++  /* At least one Accepted_proposal was reported in a reply. The highest value among
++  these is reported to be used in the accept request.*/
++  return px.is_majority(ok_count), highest_number, true, highest_proposal.Value
++}
++
++
++/*
++Evaluates the replies sent back by Paxos acceptors in response to accept requests
++and checks to see if a majority of them were accept_ok responses.
++Returns bool of whether a majority was reached or not.
++Does NOT mutate local px instance or take out any locks.
++*/
++func (px *Paxos) evaluate_accept_replies(replies_array []AcceptReply) (majority bool){
++  var ok_count = 0                  // number replies with accept_ok = true
++  for _, reply := range replies_array {
++    if reply.Accept_ok {
++      ok_count += 1
++    }
++  }
++  return px.is_majority(ok_count)
++}
++
++
++/*
++In the tests used by test_test.go, the tail ends of server names are usually unique 
++enough to identify the server in printouts.
++*/
++func short_name(server_name string, end int) string {
++  if len(server_name) < end {
++    return server_name
++  }
++  return server_name[len(server_name)-end:]
+ }
+ 
++
++
++
++// Make/Kill Paxos instances, RPC call helper
++///////////////////////////////////////////////////////////////////////////////
++
++
+ //
++// call() sends an RPC to the rpcname handler on server srv
++// with arguments args, waits for the reply, and leaves the
++// reply in reply. the reply argument should be a pointer
++// to a reply structure.
+ // the application wants to know whether this
+ // peer thinks an instance has been decided,
+ // and if so what the agreed value is. Status()
+ // should just inspect the local peer state;
+ // it should not contact other Paxos peers.
+ //
+-func (px *Paxos) Status(seq int) (Fate, interface{}) {
+-	// Your code here.
+-	return Pending, nil
++// the return value is true if the server responded, and false
++// if call() was not able to contact the server. in particular,
++// the replys contents are only valid if call() returned true.
++//
++// you should assume that call() will time out and return an
++// error after a while if it does not get a reply from the server.
++//
++// please use call() to send all RPCs, in client.go and server.go.
++// please do not change this function.
++//
++func call(srv string, name string, args interface{}, reply interface{}) bool {
++  c, err := rpc.Dial("unix", srv)
++  if err != nil {
++    err1 := err.(*net.OpError)
++    if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
++      fmt.Printf("paxos Dial() failed: %v\n", err1)
++    }
++    return false
++  }
++  defer c.Close()
++    
++  err = c.Call(name, args, reply)
++  if err == nil {
++    return true
++  }
++  return false
+ }
+ 
+ 
+-
+ //
+ // tell the peer to shut itself down.
+ // for testing.
+-// please do not change these two functions.
++// please do not change this function.
+ //
+ func (px *Paxos) Kill() {
+-	atomic.StoreInt32(&px.dead, 1)
+-	if px.l != nil {
+-		px.l.Close()
+-	}
++  atomic.StoreInt32(&px.dead, 1)
++  if px.l != nil {
++    px.l.Close()
++  }
+ }
+ 
+ //
+ // has this peer been asked to shut down?
+ //
+ func (px *Paxos) isdead() bool {
+-	return atomic.LoadInt32(&px.dead) != 0
++  return atomic.LoadInt32(&px.dead) != 0
+ }
+ 
+ // please do not change these two functions.
+ func (px *Paxos) setunreliable(what bool) {
+-	if what {
+-		atomic.StoreInt32(&px.unreliable, 1)
+-	} else {
+-		atomic.StoreInt32(&px.unreliable, 0)
+-	}
++  if what {
++    atomic.StoreInt32(&px.unreliable, 1)
++  } else {
++    atomic.StoreInt32(&px.unreliable, 0)
++  }
+ }
+ 
+ func (px *Paxos) isunreliable() bool {
+-	return atomic.LoadInt32(&px.unreliable) != 0
++  return atomic.LoadInt32(&px.unreliable) != 0
+ }
+ 
++
+ //
+ // the application wants to create a paxos peer.
+ // the ports of all the paxos peers (including this one)
+ // are in peers[]. this servers port is peers[me].
+ //
+ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
+-	px := &Paxos{}
+-	px.peers = peers
+-	px.me = me
+-
+-
+-	// Your initialization code here.
+-
+-	if rpcs != nil {
+-		// caller will create socket &c
+-		rpcs.Register(px)
+-	} else {
+-		rpcs = rpc.NewServer()
+-		rpcs.Register(px)
+-
+-		// prepare to receive connections from clients.
+-		// change "unix" to "tcp" to use over a network.
+-		os.Remove(peers[me]) // only needed for "unix"
+-		l, e := net.Listen("unix", peers[me])
+-		if e != nil {
+-			log.Fatal("listen error: ", e)
+-		}
+-		px.l = l
+-
+-		// please do not change any of the following code,
+-		// or do anything to subvert it.
+-
+-		// create a thread to accept RPC connections
+-		go func() {
+-			for px.isdead() == false {
+-				conn, err := px.l.Accept()
+-				if err == nil && px.isdead() == false {
+-					if px.isunreliable() && (rand.Int63()%1000) < 100 {
+-						// discard the request.
+-						conn.Close()
+-					} else if px.isunreliable() && (rand.Int63()%1000) < 200 {
+-						// process the request but force discard of reply.
+-						c1 := conn.(*net.UnixConn)
+-						f, _ := c1.File()
+-						err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
+-						if err != nil {
+-							fmt.Printf("shutdown: %v\n", err)
+-						}
+-						atomic.AddInt32(&px.rpcCount, 1)
+-						go rpcs.ServeConn(conn)
+-					} else {
+-						atomic.AddInt32(&px.rpcCount, 1)
+-						go rpcs.ServeConn(conn)
+-					}
+-				} else if err == nil {
+-					conn.Close()
+-				}
+-				if err != nil && px.isdead() == false {
+-					fmt.Printf("Paxos(%v) accept: %v\n", me, err.Error())
+-				}
+-			}
+-		}()
+-	}
+-
+-
+-	return px
++  px := &Paxos{}
++  px.peers = peers
++  px.me = me
++  // Your initialization code here.
++  px.peer_count = len(peers)
++  px.state = map[int]*AgreementState{}
++  px.done = map[string]int{}
++  for _, peer := range px.peers {
++    // First agreement instance agreement_number is 0. Initially clients have not marked it done.
++    px.done[peer] = -1     
++  }
++  
++  if rpcs != nil {
++    // caller will create socket &c
++    rpcs.Register(px)
++  } else {
++    rpcs = rpc.NewServer()
++    rpcs.Register(px)
++
++    // prepare to receive connections from clients.
++    // change "unix" to "tcp" to use over a network.
++    os.Remove(peers[me]) // only needed for "unix"
++    l, e := net.Listen("unix", peers[me]);
++    if e != nil {
++      log.Fatal("listen error: ", e);
++    }
++    px.l = l
++    
++    // please do not change any of the following code,
++    // or do anything to subvert it.
++    
++    // create a thread to accept RPC connections
++    go func() {
++      for px.isdead() == false {
++        conn, err := px.l.Accept()
++        if err == nil && px.isdead() == false {
++          if px.isunreliable() && (rand.Int63() % 1000) < 100 {
++            // discard the request.
++            conn.Close()
++          } else if px.isunreliable() && (rand.Int63() % 1000) < 200 {
++            // process the request but force discard of reply.
++            c1 := conn.(*net.UnixConn)
++            f, _ := c1.File()
++            err := syscall.Shutdown(int(f.Fd()), syscall.SHUT_WR)
++            if err != nil {
++              fmt.Printf("shutdown: %v\n", err)
++            }
++            px.rpcCount++
++            go rpcs.ServeConn(conn)
++          } else {
++            px.rpcCount++
++            go rpcs.ServeConn(conn)
++          }
++        } else if err == nil {
++          conn.Close()
++        }
++        if err != nil && px.isdead() == false {
++          fmt.Printf("Paxos(%v) accept: %v\n", me, err.Error())
++        }
++      }
++    }()
++  }
++
++
++  return px
+ }
+diff --git a/src/shardkv/client.go b/src/shardkv/client.go
+index 8158fd4..7c26127 100644
+--- a/src/shardkv/client.go
++++ b/src/shardkv/client.go
+@@ -5,27 +5,26 @@ import "net/rpc"
+ import "time"
+ import "sync"
+ import "fmt"
+-import "crypto/rand"
+-import "math/big"
++// import "crypto/rand"
++// import "math/big"
++import "math/rand"
+ 
+ type Clerk struct {
+ 	mu     sync.Mutex // one RPC at a time
+ 	sm     *shardmaster.Clerk
+ 	config shardmaster.Config
+ 	// You'll have to modify Clerk.
++	id int                      // unique id serves as a client identifier
++	get_request_id func() int   // returns unique request ids (among requests by this client)
+ }
+ 
+-func nrand() int64 {
+-	max := big.NewInt(int64(1) << 62)
+-	bigx, _ := rand.Int(rand.Reader, max)
+-	x := bigx.Int64()
+-	return x
+-}
+ 
+ func MakeClerk(shardmasters []string) *Clerk {
+ 	ck := new(Clerk)
+ 	ck.sm = shardmaster.MakeClerk(shardmasters)
+ 	// You'll have to modify MakeClerk.
++	ck.id = rand.Int()
++ 	ck.get_request_id = make_int_generator()
+ 	return ck
+ }
+ 
+@@ -87,6 +86,8 @@ func (ck *Clerk) Get(key string) string {
+ 	defer ck.mu.Unlock()
+ 
+ 	// You'll have to modify Get().
++	client_id := ck.id
++ 	request_id := ck.get_request_id()
+ 
+ 	for {
+ 		shard := key2shard(key)
+@@ -99,6 +100,8 @@ func (ck *Clerk) Get(key string) string {
+ 			// try each server in the shard's replication group.
+ 			for _, srv := range servers {
+ 				args := &GetArgs{}
++				args.Client_id = client_id
++				args.Request_id = request_id
+ 				args.Key = key
+ 				var reply GetReply
+ 				ok := call(srv, "ShardKV.Get", args, &reply)
+@@ -116,6 +119,8 @@ func (ck *Clerk) Get(key string) string {
+ 		// ask master for a new configuration.
+ 		ck.config = ck.sm.Query(-1)
+ 	}
++
++	return ""
+ }
+ 
+ // send a Put or Append request.
+@@ -124,6 +129,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
+ 	defer ck.mu.Unlock()
+ 
+ 	// You'll have to modify PutAppend().
++	client_id := ck.id
++    request_id := ck.get_request_id()
+ 
+ 	for {
+ 		shard := key2shard(key)
+@@ -136,6 +143,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
+ 			// try each server in the shard's replication group.
+ 			for _, srv := range servers {
+ 				args := &PutAppendArgs{}
++				args.Client_id = client_id
++				args.Request_id = request_id
+ 				args.Key = key
+ 				args.Value = value
+ 				args.Op = op
+@@ -163,3 +172,17 @@ func (ck *Clerk) Put(key string, value string) {
+ func (ck *Clerk) Append(key string, value string) {
+ 	ck.PutAppend(key, value, "Append")
+ }
++
++/*
++Returns a function which is a generator of a deterministic (read: not unique across 
++instances) sequence of unique, incrementing ints and provides such an int each time
++it is called.
++*/
++func make_int_generator() (func() int) {
++  base_id := -1
++  return func() int {
++    base_id += 1
++    return base_id
++  }
++}
++
+diff --git a/src/shardkv/common.go b/src/shardkv/common.go
+index ec5a34c..21154d4 100644
+--- a/src/shardkv/common.go
++++ b/src/shardkv/common.go
+@@ -13,10 +13,19 @@ const (
+ 	OK            = "OK"
+ 	ErrNoKey      = "ErrNoKey"
+ 	ErrWrongGroup = "ErrWrongGroup"
++	NotReady = "NotReady"
+ )
+ 
+ type Err string
+ 
++type Args interface{}
++type OpResult interface{}
++type Reply interface{}
++
++type ReConfigStartArgs struct {}
++type ReConfigEndArgs struct {}
++type NoopArgs struct {}
++
+ type PutAppendArgs struct {
+ 	Key   string
+ 	Value string
+@@ -24,6 +33,8 @@ type PutAppendArgs struct {
+ 	// You'll have to add definitions here.
+ 	// Field names must start with capital letters,
+ 	// otherwise RPC will break.
++	Client_id int       // client_id
++ 	Request_id int      // request_id unique per client
+ 
+ }
+ 
+@@ -34,6 +45,8 @@ type PutAppendReply struct {
+ type GetArgs struct {
+ 	Key string
+ 	// You'll have to add definitions here.
++	Client_id int      // client_id
++	Request_id int     // request_id unique per client
+ }
+ 
+ type GetReply struct {
+@@ -41,3 +54,22 @@ type GetReply struct {
+ 	Value string
+ }
+ 
++
++// ReceiveShardArgs and ReceiveShardReply
++///////////////////////////////////////////////////////////////////////////////
++
++type ReceiveShardArgs struct {
++  Kvpairs []KVPair     // slice of Key/Value pairs
++  Trans_to int         // config number the sender is transitioning to
++  Shard_index int      // index of shard being sent
++}
++
++type ReceiveShardReply struct {
++  Err Err
++}
++
++type SentShardArgs struct {
++  Trans_to int        // config number the sender is transitioning to
++  Shard_index int     // index of shard that was successfully sent
++}
++
+diff --git a/src/shardkv/server.go b/src/shardkv/server.go
+index 66ee1af..96eaba2 100644
+--- a/src/shardkv/server.go
++++ b/src/shardkv/server.go
+@@ -13,7 +13,7 @@ import "syscall"
+ import "encoding/gob"
+ import "math/rand"
+ import "shardmaster"
+-
++import "strconv"
+ 
+ const Debug = 0
+ 
+@@ -24,11 +24,35 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
+ 	return
+ }
+ 
++const (
++  Get = "Get"
++  Put = "Put"
++  Append = "Append"
++  ReConfigStart = "ReConfigStart"
++  SentShard = "SentShard"
++  ReceiveShard = "ReceiveShard"
++  ReConfigEnd = "ReConfigEnd"
++  Noop = "Noop"
++)
+ 
+ type Op struct {
+ 	// Your definitions here.
++	Id string          // uuid, identifies the operation itself
++  //Request_id string  // combined, stringified client_id:request_id, identifies the client requested operation
++	Name string        // Operation name: Get, Put, ConfigChange, Transfer, ConfigDone
++	Args Args          // GetArgs, PutAppendArgs, etc.
++}
++
++func generate_uuid() string {
++  return strconv.Itoa(rand.Int())
+ }
+ 
++func makeOp(name string, args Args) (Op) {
++	return Op{Id: generate_uuid(),
++			Name: name,
++			Args: args,
++			}
++}
+ 
+ type ShardKV struct {
+ 	mu         sync.Mutex
+@@ -42,27 +66,634 @@ type ShardKV struct {
+ 	gid int64 // my replica group ID
+ 
+ 	// Your definitions here.
++	config_now shardmaster.Config    // latest Config of replica groups
++	config_prior shardmaster.Config  // previous Config of replica groups
++	shards []bool                    // whether or not ith shard is present
++	transition_to int                // Num of new Config transitioning to, -1 if not transitioning
++	// Key/Value State
++	operation_number int             // agreement number of latest applied operation
++	storage map[string]string        // key/value data storage
++	cache map[string]Reply           // "client_id:request_id" -> reply cache  
+ }
+ 
+ 
+ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
+ 	// Your code here.
++	kv.mu.Lock()
++	defer kv.mu.Unlock()
++	// Don't accept if no initial config yet.
++	if kv.config_now.Num == 0 {
++		return nil
++	}
++
++	operation := makeOp(Get, *args)                      // requested Op
++	agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++
++	kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++	op_result := kv.perform_operation(agreement_number, operation)  // perform requested Op
++	get_result := op_result.(GetReply)                   // type assertion
++	reply.Value = get_result.Value
++	reply.Err = get_result.Err
+ 	return nil
+ }
+ 
+ // RPC handler for client Put and Append requests
+ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+ 	// Your code here.
++	kv.mu.Lock()
++	defer kv.mu.Unlock()
++	// Don't accept if no initial config yet.
++	if kv.config_now.Num == 0 {
++		return nil
++	}
++
++	operation := makeOp(args.Op, *args)              // requested Op
++	agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++
++	kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++	op_result := kv.perform_operation(agreement_number, operation)  // perform requested Op
++	putAppend_result := op_result.(PutAppendReply)                   // type assertion
++	reply.Err = putAppend_result.Err
+ 	return nil
+ }
+ 
++/*
++Accepts a ReceiveShard, starts and awaits Paxos agreement for the op, performs all
++operations up to and then including the requested operation.
++Does not respond until the requested operation has been applied.
++*/
++func (kv *ShardKV) ReceiveShard(args *ReceiveShardArgs, reply *ReceiveShardReply) error {
++  kv.mu.Lock()
++  defer kv.mu.Unlock()
++  // Don't accept if no initial config yet.
++  if kv.config_now.Num == 0 {
++    return nil
++  }
++
++  operation := makeOp(ReceiveShard, *args)             // requested Op
++  agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++
++  kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++  op_result := kv.perform_operation(agreement_number, operation)  // perform requested Op
++  receive_result := op_result.(ReceiveShardReply)      // type assertion
++  reply.Err = receive_result.Err
++  return nil
++}
++
++
+ //
+ // Ask the shardmaster if there's a new configuration;
+ // if so, re-configure.
+ //
+ func (kv *ShardKV) tick() {
++  kv.mu.Lock()
++  defer kv.mu.Unlock()
++  kv.ensure_updated()
++
++  if kv.transition_to == -1 {         // Not currently changing Configs
++    // Special initial case
++    if kv.config_now.Num == 0 {
++      config := kv.sm.Query(1)
++      if config.Num == 1 {
++        kv.config_prior = kv.config_now
++        kv.config_now = config
++        // No shard transfers needed. Automatically have shards of first valid Config.
++        kv.shards = shard_state(kv.config_now.Shards, kv.gid)
++        return
++      }
++      // No Join has been performed yet. ShardMaster still has initial Config
++      return
++    }
++
++    // are there new Configs we this replica group should be conforming to?
++    config := kv.sm.Query(-1)     // type ShardMaster.Config
++    if config.Num > kv.config_now.Num {      // ShardMaster reporting a new Config
++      operation := makeOp(ReConfigStart, ReConfigStartArgs{})  // requested Op
++      agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++
++      kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++      kv.perform_operation(agreement_number, operation)  // perform requested Op
++    } else {
++      // Otherwise, no new Config and no action needed
++    }
++  } else {                           // Currently changing Configs
++    kv.broadcast_shards()
++    
++    if kv.done_sending_shards() && kv.done_receiving_shards() {
++      operation := makeOp(ReConfigEnd, ReConfigEndArgs{})  // requested Op
++      agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++
++      kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++      kv.perform_operation(agreement_number, operation)  // perform requested Op
++    }
++  }
++  return
++}
++
++func (kv *ShardKV) paxos_agree(operation Op) (int) {
++  var agreement_number int
++  var decided_operation = Op{}
++
++  for decided_operation.Id != operation.Id {
++    agreement_number = kv.available_agreement_number()
++    kv.px.Start(agreement_number, operation)
++    decided_operation = kv.await_paxos_decision(agreement_number).(Op)  // type assertion
++  }
++  return agreement_number
++}
++
++func (kv *ShardKV) await_paxos_decision(agreement_number int) (decided_val interface{}) {
++  sleep_max := 10 * time.Second
++  sleep_time := 10 * time.Millisecond
++  for {
++    has_decided, decided_val := kv.px.Status(agreement_number)
++    if has_decided == paxos.Decided{
++      return decided_val
++    }
++    time.Sleep(sleep_time)
++    if sleep_time < sleep_max {
++      sleep_time *= 2
++    }
++  }
++  panic("unreachable")
+ }
+ 
++func (kv *ShardKV) available_agreement_number() int {
++  return kv.px.Max() + 1
++}
++
++
++/*
++Wrapper around the server's paxos instance px.Status call which converts the (bool,
++interface{}) value returned by Paxos into a (bool, Op) pair. 
++Accepts the agreement number which should be passed to the paxos Status call and 
++panics if the paxos value is not an Op.
++*/
++func (kv *ShardKV) px_status_op(agreement_number int) (bool, Op){
++  has_decided, value := kv.px.Status(agreement_number)
++  if has_decided == paxos.Decided {
++    operation, ok := value.(Op)    // type assertion, Op expected
++    if ok {
++        return true, operation
++    }
++    panic("expected Paxos agreement instance values of type Op at runtime. Type assertion failed.")
++  }
++  return false, Op{}
++}
++
++
++/*
++Attempts to use the given operation struct to drive agreement among Shardmaster paxos 
++peers using the given agreement number. Discovers the operation that was decided on
++for the specified agreement number.
++*/
++func (kv *ShardKV) drive_discovery(operation Op, agreement_number int) Op {
++  kv.px.Start(agreement_number, operation)
++  decided_operation := kv.await_paxos_decision(agreement_number).(Op)  // type assertion
++  return decided_operation
++}
++
++/*
++Performs Paxos agreement to submit a Noop operation and performs all operations up to
++and including the agreed upon Noop
++*/
++func (kv *ShardKV) ensure_updated() {
++  noop := makeOp(Noop, NoopArgs{})                     // requested Op
++  agreement_number := kv.paxos_agree(noop)           // sync call returns after agreement reached
++
++  kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++  kv.perform_operation(agreement_number, noop)       // perform requested Op
++}
++
++
++// Methods for Performing ShardKV Operations
++///////////////////////////////////////////////////////////////////////////////
++
++/*
++Synchronously performs all operations up to but NOT including the 'limit' op_number.
++The set of operations to be performed may not all yet be known to the local paxos
++instance so it will propose No_Ops to discover missing operations.
++*/
++func (kv *ShardKV) perform_operations_prior_to(limit int) {
++  op_number := kv.operation_number + 1     // op number currently being performed
++  has_decided, operation := kv.px_status_op(op_number)
++
++  for op_number < limit {       // continue looping until op_number == limit - 1 has been performed   
++    if has_decided {
++      kv.perform_operation(op_number, operation)   // perform_operation mutates kv.operation_number
++      op_number = kv.operation_number + 1
++      has_decided, operation = kv.px_status_op(op_number)
++    } else {
++      noop := makeOp(Noop, NoopArgs{})          // Force Paxos instance to discover next operation or agree on a Noop
++      kv.drive_discovery(noop, op_number)     // synchronously proposes Noop and discovered decided operation
++      has_decided, operation = kv.px_status_op(op_number)
++      kv.perform_operation(op_number, operation)
++      op_number = kv.operation_number + 1
++      has_decided, operation = kv.px_status_op(op_number)
++    }
++  }
++}
++
++/*
++Accepts an Op operation which should be performed locally, reads the name of the
++operation and calls the appropriate handler by passing the operation arguments.
++Returns OpResult from performing the operation and increments (mutates) the ShardKV
++operation_number field to the latest pperation (performed in increasing order).
++*/
++func (kv *ShardKV) perform_operation(op_number int, operation Op) OpResult {
++  var result OpResult
++
++  switch operation.Name {
++    case "Get":
++      var get_args = (operation.Args).(GetArgs)     // type assertion, Args is a GetArgs
++      result = kv.get(&get_args)
++    case "Put":
++      var put_args = (operation.Args).(PutAppendArgs)     // type assertion, Args is a PutAppendArgs
++      result = kv.put(&put_args)
++    case "Append":
++      var append_args = (operation.Args).(PutAppendArgs)     // type assertion, Args is a PutAppendArgs
++      result = kv.append(&append_args)
++    case "ReceiveShard":
++      var receive_shard_args = (operation.Args).(ReceiveShardArgs)     // type assertion
++      result = kv.receive_shard(&receive_shard_args)
++    case "ReConfigStart":
++      var re_config_start_args = (operation.Args).(ReConfigStartArgs)  // type assertion
++      result = kv.re_config_start(&re_config_start_args)
++    case "SentShard":
++      var sent_shard_args = (operation.Args).(SentShardArgs)           // type assertion
++      result = kv.sent_shard(&sent_shard_args)
++    case "ReConfigEnd":
++      var re_config_end_args = (operation.Args).(ReConfigEndArgs)     // type assertion
++      result = kv.re_config_end(&re_config_end_args)
++    case "Noop":
++      // zero-valued result of type interface{} is nil
++    default:
++      panic(fmt.Sprintf("unexpected Op name '%s' cannot be performed", operation.Name))
++  }
++  kv.operation_number = op_number     // latest operation that has been applied
++  kv.px.Done(op_number)               // local Paxos no longer needs to remember Op
++  return result
++}
++
++// Methods for Managing Shard State
++///////////////////////////////////////////////////////////////////////////////
++
++/*
++Checks against kv.config_now.Shards to see if the shardkv server is/(will be once
++ongoing xfer complete) responsible for the given key. Returns true if so and false
++otherwise.
++*/
++func (kv *ShardKV) owns_shard(key string) bool {
++  shard_index := key2shard(key)
++  return kv.config_now.Shards[shard_index] == kv.gid
++}
++
++
++/*
++Returns whether or not the shardkv server currently has the shard corresponding
++to the given stirng key. Consults the kv.shards []bool state slice which 
++represents which shards are present. kv.shards is kept up to date during shard 
++transfers that occur during config transitions.
++*/
++func (kv *ShardKV) has_shard(key string) bool {
++  shard_index := key2shard(key)
++  return kv.shards[shard_index]
++}
++
++/*
++Converts a shards array of int64 gids (such as Config.Shards) into a slice of
++booleans of the same length where an entry is true if the gid of the given 
++shards array equals my_gid and false otherwise.
++*/
++func shard_state(shards [shardmaster.NShards]int64, my_gid int64) []bool {
++  shard_state := make([]bool, len(shards))
++  for shard_index, gid := range shards {
++    if gid == my_gid {
++      shard_state[shard_index] = true
++    } else {
++      shard_state[shard_index] = false
++    }
++  }
++  return shard_state
++}
++
++func (kv *ShardKV) done_sending_shards() bool {
++  goal_shards := shard_state(kv.config_now.Shards, kv.gid)
++  for shard_index, _ := range kv.shards {
++    if kv.shards[shard_index] == true && goal_shards[shard_index] == false {
++      // still at least one send has not been acked
++      return false
++    }
++  } 
++  return true
++}
++
++func (kv *ShardKV) done_receiving_shards() bool {
++  goal_shards := shard_state(kv.config_now.Shards, kv.gid)
++  for shard_index, _ := range kv.shards {
++    if kv.shards[shard_index] == false && goal_shards[shard_index] == true {
++      // still at least one send has not been received
++      return false
++    }
++  } 
++  return true
++}
++
++func (kv *ShardKV) broadcast_shards() {
++  goal_shards := shard_state(kv.config_now.Shards, kv.gid)
++  for shard_index, _ := range kv.shards {
++    if kv.shards[shard_index] == true && goal_shards[shard_index] == false {
++      // shard_index should be transferred to gid in new config
++      new_replica_group_gid := kv.config_now.Shards[shard_index]
++      kv.send_shard(shard_index, new_replica_group_gid)
++    }
++  } 
++  return
++}
++
++type KVPair struct {
++  Key string
++  Value string
++}
++
++func (kv *ShardKV) send_shard(shard_index int, gid int64) {
++  // collect the key/value pairs that are part of the shard to be transferred
++  var kvpairs []KVPair
++  for key,value := range kv.storage {
++    if key2shard(key) == shard_index {
++      kvpairs = append(kvpairs, KVPair{Key: key, Value: value})
++    }
++  }
++
++  servers := kv.config_now.Groups[gid]
++  // next_rg_server := servers[rand.Intn(len(servers))]
++  // args := &ReceiveShardArgs{}    // declare and init struct with zero-valued fields
++  //   args.Kvpairs = kvpairs
++  //   args.Trans_to = kv.transition_to
++  //   args.Shard_index = shard_index
++  //   var reply ReceiveShardReply
++  //   // Attempt to send shard to random server in replica group now owning the shard
++  //   ok := call(next_rg_server, "ShardKV.ReceiveShard", args, &reply)
++  //   if ok && reply.Err == OK {
++  //     sent_shard_args := SentShardArgs{Shard_index: shard_index, Trans_to: kv.transition_to}
++  //     operation := makeOp(SentShard, sent_shard_args)      // requested Op
++  //     agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++  //     kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++  //     kv.perform_operation(agreement_number, operation)  // perform requested Op
++  //   }
++
++  for _, srv := range servers {
++    args := &ReceiveShardArgs{}    // declare and init struct with zero-valued fields
++    args.Kvpairs = kvpairs
++    args.Trans_to = kv.transition_to
++    args.Shard_index = shard_index
++    var reply ReceiveShardReply
++    // Attempt to send shard to random server in replica group now owning the shard
++    ok := call(srv, "ShardKV.ReceiveShard", args, &reply)
++    if ok && reply.Err == OK {
++      sent_shard_args := SentShardArgs{Shard_index: shard_index, Trans_to: kv.transition_to}
++      operation := makeOp(SentShard, sent_shard_args)      // requested Op
++      agreement_number := kv.paxos_agree(operation)      // sync call returns after agreement reached
++      kv.perform_operations_prior_to(agreement_number)   // sync call, operations up to limit performed
++      kv.perform_operation(agreement_number, operation)  // perform requested Op
++      return
++    }
++  }
++}
++
++/*
++Used when memory of a shard that was live in the past can be deleted which removes all
++key/value pairs in storage corresponding to the shard and marks the kv.shards entry
++for the shard as false since the shard has now been sent and should be the same as the
++goal shards state.
++*/ 
++func (kv *ShardKV) remove_shard(shard_index int) {
++  for key, _ := range kv.storage {
++    if key2shard(key) == shard_index {
++      delete(kv.storage, key)
++    }
++  }
++  kv.shards[shard_index] = false    // shard is no longer maintained on shardkv server
++}
++
++// ShardKV RPC operations (internal, performed after paxos agreement)
++///////////////////////////////////////////////////////////////////////////////
++
++/*
++If the key to get is in a shard that is owned by the shardkv's replica group and 
++present then a standard get is performed and the reply cached and returned. If the 
++the key's shard is owned by the replica group, but not yet present, a reply with
++an error is returned, but the reply is not cached since the client is expected to
++retry at a later point. Finally, if the key is in a shard that is not owned by the 
++replica group, an ErrWrongGroup reply is cached and returned.
++Caller responsible for attaining lock on shardkv properties.
++*/
++func (kv *ShardKV) get(args *GetArgs) OpResult {
++  client_request := request_identifier(args.Client_id, args.Request_id) // string
++
++  reply, present := kv.cache[client_request]
++  if present {
++    return reply       // client requested get has already been performed
++  }
++
++  // client requested get has not been performed
++  get_reply := GetReply{}
++
++  if kv.owns_shard(args.Key) {
++    // currently or soon to be responsible for the key
++    if kv.has_shard(args.Key) {
++      // currently has the needed shard (note: config transition may still be in progress)
++      value, present := kv.storage[args.Key]
++      if present {
++        get_reply.Value = value
++        get_reply.Err = OK
++      } else {
++        get_reply.Value = ""
++        get_reply.Err = ErrNoKey
++      }
++      // cache get reply so duplicate client requests not performed
++      kv.cache[client_request] = get_reply    
++      return get_reply
++    }
++    // waiting to receive the shard
++    get_reply.Err = NotReady
++    // do not cache, expecting client to retry after transition progress
++    return get_reply
++  }
++  // otherwise, the replica group does not own the needed shard
++  get_reply.Err = ErrWrongGroup
++  // client may know a new config that shardkv doesn't. Don't cache rejection.
++  return get_reply   
++}
++
++/*
++*/
++func (kv *ShardKV) put(args *PutAppendArgs) OpResult {
++  client_request := request_identifier(args.Client_id, args.Request_id) // string
++
++  reply, present := kv.cache[client_request]
++  if present {
++    return reply                   // client requested put has already been performed
++  }
++
++  // client requested put has not been performed
++  put_reply := PutAppendReply{}
++
++  if kv.owns_shard(args.Key) {
++    // currently or soon to be responsible for the key
++    if kv.has_shard(args.Key) {
++      // currently has the needed shard (note: config transition may still be in progress)
++      kv.storage[args.Key] = args.Value
++      put_reply := PutAppendReply{Err: OK}             // reply for successful Put request
++
++      // cache put reply so duplicate client requests not performed
++      kv.cache[client_request] = put_reply    
++      return put_reply
++    }
++    // waiting to receive shard
++    put_reply.Err = NotReady
++    // do not cache, expecting client to retry after transition progress
++    return put_reply
++  }
++
++  // otherwise, the replica group does not own the needed shard
++  put_reply.Err = ErrWrongGroup
++  // client may know a new config that shardkv doesn't. Don't cache rejection.
++  return put_reply
++}
++
++
++
++func (kv *ShardKV) append(args *PutAppendArgs) OpResult {
++  client_request := request_identifier(args.Client_id, args.Request_id) // string
++
++  reply, present := kv.cache[client_request]
++  if present {
++    return reply                   // client requested put has already been performed
++  }
++
++  // client requested put has not been performed
++  append_reply := PutAppendReply{}
++
++  if kv.owns_shard(args.Key) {
++    // currently or soon to be responsible for the key
++    if kv.has_shard(args.Key) {
++      // currently has the needed shard (note: config transition may still be in progress)
++      kv.storage[args.Key] = kv.storage[args.Key] + args.Value
++      append_reply := PutAppendReply{Err: OK}             // reply for successful Append request
++
++      // cache append reply so duplicate client requests not performed
++      kv.cache[client_request] = append_reply    
++      return append_reply
++    }
++    // waiting to receive shard
++    append_reply.Err = NotReady
++    // do not cache, expecting client to retry after transition progress
++    return append_reply
++  }
++
++  // otherwise, the replica group does not own the needed shard
++  append_reply.Err = ErrWrongGroup
++  // client may know a new config that shardkv doesn't. Don't cache rejection.
++  return append_reply
++}
++
++
++/*
++Local or fellow ShardKV peer has detected that ShardMaster has a more recent Config.
++All peers have paxos agreed that this operation marks the transition to the next 
++higher Config. Fetch the numerically next Config from the ShardMaster and fire first
++set of shard transfer broadcasts. Also set shard_transition_period to true. The
++shard_transition_period will be over once a peers paxos agree on a ReConfigEnd 
++operation.
++*/
++func (kv *ShardKV) re_config_start(args *ReConfigStartArgs) OpResult {
++
++  if kv.transition_to == kv.config_now.Num {  // If currently transitioning
++    // Multiple peers committed ReConfigStart operations, only need to start once
++    fmt.Printf("Already transitioning to %d\n", kv.transition_to)
++    return nil
++  }
++  next_config := kv.sm.Query(kv.config_now.Num + 1)    // next Config
++  kv.config_prior = kv.config_now
++  kv.config_now = next_config
++  kv.transition_to = kv.config_now.Num
++
++  kv.shards = shard_state(kv.config_prior.Shards, kv.gid)
++  // goal_shards := shard_state(kv.config_now.Shards, kv.gid)
++
++  return nil
++}
++
++func (kv *ShardKV) receive_shard(args *ReceiveShardArgs) OpResult {
++  client_request := internal_request_identifier(args.Trans_to, args.Shard_index) // string
++
++  reply, present := kv.cache[client_request]
++  if present {
++    return reply       // client requested ReceiveShard has already been performed
++  }
++
++  // client requested get has not been performed
++  receive_shard_reply := ReceiveShardReply{}
++
++  // not yet transitioning or working on an earlier transition
++  if kv.transition_to < args.Trans_to {
++    // do not cache the reply, expect sender to resend after we've caught up
++    receive_shard_reply.Err = NotReady
++    return receive_shard_reply
++
++  } else if kv.transition_to == args.Trans_to {
++    // working on same transition
++    for _, pair := range args.Kvpairs {
++      kv.storage[pair.Key] = pair.Value
++    }
++    kv.shards[args.Shard_index] = true   // key/value pairs for the shard have been received 
++    receive_shard_reply.Err = OK
++    kv.cache[client_request] = receive_shard_reply
++    return receive_shard_reply
++  } 
++  // kv.transition_to > args.trans_to, already received all shards needed.
++  receive_shard_reply.Err = OK
++  kv.cache[client_request] = receive_shard_reply
++  return receive_shard_reply
++}
++
++
++func (kv *ShardKV) sent_shard(args *SentShardArgs) OpResult {
++  if kv.transition_to == args.Trans_to {
++    kv.remove_shard(args.Shard_index)
++  }
++  return nil
++}
++
++
++/*
++Local or fellow ShardKV peer has successfully recieved all needed shards for the
++new Config (thus other peers can determine from the paxos log) and has received
++acks from replica groups that were to receive shards from this replica group during
++the transition tofrom all replica groups that 
++*/
++func (kv *ShardKV) re_config_end(args *ReConfigEndArgs) OpResult {
++  if kv.transition_to == -1 {
++    return nil
++  }
++  kv.transition_to = -1            // no longer in transition to a new config
++  return nil
++}
++
++
++// Helpers
++///////////////////////////////////////////////////////////////////////////////
++
++func request_identifier(client_id int, request_id int) string {
++  return strconv.Itoa(client_id) + ":" + strconv.Itoa(request_id)
++}
++
++func internal_request_identifier(client_id int, request_id int) string {
++  return "i" + request_identifier(client_id, request_id)
++}
++
++
+ // tell the server to shut itself down.
+ // please don't change these two functions.
+ func (kv *ShardKV) kill() {
+@@ -108,6 +739,23 @@ func StartServer(gid int64, shardmasters []string,
+ 	kv.sm = shardmaster.MakeClerk(shardmasters)
+ 
+ 	// Your initialization code here.
++	gob.Register(GetArgs{})
++	gob.Register(PutAppendArgs{})
++	gob.Register(ReConfigStartArgs{})
++	gob.Register(ReConfigEndArgs{})
++	gob.Register(ReceiveShardArgs{})
++	gob.Register(SentShardArgs{})
++	gob.Register(NoopArgs{})
++	gob.Register(KVPair{})
++	kv.config_prior = shardmaster.Config{}  // initial prior Config
++	kv.config_prior.Groups = map[int64][]string{}  // initialize map
++	kv.config_now = shardmaster.Config{}  // initial prior Config
++	kv.config_now.Groups = map[int64][]string{}  // initialize map
++	kv.shards = make([]bool, shardmaster.NShards)
++	kv.transition_to = -1
++	kv.storage = map[string]string{}        // key/value data storage
++	kv.cache =  map[string]Reply{}          // "client_id:request_id" -> reply cache
++	kv.operation_number = -1                // first agreement number will be 0
+ 	// Don't call Join().
+ 
+ 	rpcs := rpc.NewServer()
+diff --git a/src/shardmaster/common.go b/src/shardmaster/common.go
+index 2413af3..128b5ce 100644
+--- a/src/shardmaster/common.go
++++ b/src/shardmaster/common.go
+@@ -28,33 +28,218 @@ type Config struct {
+ 	Groups map[int64][]string // gid -> servers[]
+ }
+ 
++type Args interface {}
++
+ type JoinArgs struct {
+ 	GID     int64    // unique replica group ID
+ 	Servers []string // group server ports
+ }
+ 
+-type JoinReply struct {
+-}
+-
+ type LeaveArgs struct {
+ 	GID int64
+ }
+ 
+-type LeaveReply struct {
+-}
+-
+ type MoveArgs struct {
+ 	Shard int
+ 	GID   int64
+ }
+ 
+-type MoveReply struct {
+-}
+-
+ type QueryArgs struct {
+ 	Num int // desired config number
+ }
+ 
++type NoopArgs struct {}
++
++type Reply interface {}
++
++
++type JoinReply struct {
++}
++
++type LeaveReply struct {
++}
++
++type MoveReply struct {
++}
++
+ type QueryReply struct {
+ 	Config Config
+ }
++
++type Result interface {}
++/*
++Returns a new Config which has the same values as the Config instance copy was
++called on.
++*/
++func (self *Config) copy() Config {
++  var config = Config{Num: self.Num,
++                      Shards: self.Shards,
++                      Groups: make(map[int64][]string)}
++  for key, value := range self.Groups {
++    config.Groups[key] = value
++  }
++  return config
++}
++
++/*
++Adds a new replica group (RG) with the given non-zero GID and the slice of server ports
++of the replica servers (i.e. shardkv instances) that compose the replica group.
++*/
++func (self *Config) add_replica_group(gid int64, servers []string) {
++  self.Num += 1
++  self.Groups[gid] = servers
++}
++
++/*
++Removes a replica group (RG) with the given non-zero GID. Remove a replica group before 
++calling the reassign_shards method to move the shards from the removed replica group to the
++remaining minimally loaded replica group
++*/
++func (self *Config) remove_replica_group(gid int64) {
++  self.Num += 1
++  delete(self.Groups, gid)
++}
++
++/*
++Moves a specified shard to a specified gid by reassigning the shard to that gid, overwriting
++whichever replica group gid the shard was previously assigned to.
++Does NOT rebalance as the user has explicitly requested a specific shard movement. Adding or
++removing other replica groups can undo the move though since they rebalance.
++*/
++func (self *Config) explicit_move(shard_index int, gid int64) {
++  self.Num += 1
++  self.move(shard_index, gid)
++}
++
++/*
++Assigns the shard with index shard_index to replica group gid, overwriting whatever RG it 
++was previously assigned to, if any.
++Assumes that the specified gid is an allowed gid.
++*/
++func (self *Config) move(shard_index int, gid int64) {
++  //fmt.Println("Moving ", shard_index, " from ", self.Shards[shard_index], " to rg ", gid)
++  self.Shards[shard_index] = gid
++}
++
++/*
++Initializes and populates a map representing the replica group ids to number of shards 
++maintained by that replica group mapping. Useful for determining the minimally and maximally
++loaded replica groups.
++*/
++func (self *Config) get_loads() map[int64]int {
++  rg_loads := make(map[int64]int)
++  for gid, _ := range self.Groups {
++    rg_loads[gid] = 0                  // valid replica group gids are in the Groups map
++  }
++  for _, gid := range self.Shards {
++    _, present := rg_loads[gid]        // Only increment for valid gids (i.e. in the table)
++    if present {
++      rg_loads[gid] += 1
++    }
++  }
++  return rg_loads
++}
++
++/*
++Considers all joined replica groups and determines a replica group responsible for a minimal
++number of shards among its fellow replica groups. Returns the minimally loaded RG and number 
++of shards of load on that replica replica.
++If there are NO replica groups, will return int64 0 as the minimally loaded replica group
++so that shards are switched back to gid 0.
++*/
++func (self *Config) minimally_loaded() (gid int64, load int) {
++  loads := self.get_loads()
++  var min_load_gid int64 = 0        // repica gids are int64 (o is default non-valid gid)
++  var min_load = NShards + 1        // bc 1 real RG w/ all shards preferable replica group 0
++
++  for gid, shard_count := range loads {
++    if shard_count < min_load {
++      min_load = shard_count
++      min_load_gid = gid
++    }
++  }
++  return min_load_gid, min_load
++}
++
++/*
++Considers all joined replica groups and determines a replica group responsible for a maximal
++number of shards among its fellow replica groups. Returns the maximally loaded RG and the
++number of shards of load on that replica group.
++If there are NO replica groups, will return int64 0 as the maximally loaded replica group.
++*/
++func (self *Config) maximally_loaded() (gid int64, load int) {
++  loads := self.get_loads()
++  var max_load_gid int64 = 0     // repica gids are int64 (o is default non-valid gid)
++  var max_load = 0               // non-valid RG 0 is not actually responsible for shards.
++
++  for gid, shard_count := range loads {
++    if shard_count > max_load {
++      max_load = shard_count
++      max_load_gid = gid
++    }
++  }
++  return max_load_gid, max_load
++}
++
++/*
++Returns the int difference between the maximally and minimally loaded replica groups.
++*/
++func (self *Config) load_diff() int {
++  _, min_load := self.minimally_loaded()
++  _, max_load := self.maximally_loaded()
++  return max_load - min_load
++}
++
++/*
++Iterates through the Shards array, checking whether any are assigned to the non-valid RG with
++gid 0. For each that is found, the shard is moved to the minimally loaded RG.
++If there are no valid replica groups, the shards are 'moved' to replica group 0 since 
++minimally_loaded will return gid 0, so they are still assigned to a nonvalid replica group.
++*/
++func (self *Config) promote_shards_from_nonvalids() {
++  for shard_index, gid := range self.Shards {
++    if gid == 0 {                // non-valid RG, used before a Join has occurred.
++      min_rg, _ := self.minimally_loaded()
++      self.move(shard_index, min_rg)
++    }
++  }
++  return
++}
++
++/*
++Iterates through the Shards array, checking whether any shards were assigned to the passed
++gid. Any that are found are moved to a minimally loaded replica group in preparation for 
++the removal of the specified replica group.
++*/
++func (self *Config) reassign_shards(bad_gid int64) {
++  for shard_index, gid := range self.Shards {
++    if gid == bad_gid {
++      min_rg, _ := self.minimally_loaded()
++      self.move(shard_index, min_rg)
++    }
++  }
++}
++
++/*
++Performs shard rebalancing using the given migration threshold (diff between max # shards and 
++min # or shards) by moving shards from the maximally loaded RG to the minimally loaded RG in
++order to minimize the number of shard transfers needed to reach a balanced state.
++Requires threshold >= 1. Mutates the self Config object.
++*/
++func (self *Config) rebalance(threshold int) {
++  if threshold < 1 {
++    return
++  }
++  var max_rg, min_rg int64
++  for self.load_diff() > threshold {
++    max_rg, _ = self.maximally_loaded()
++    min_rg, _ = self.minimally_loaded()
++    // Choose 1 from the maximally loaded RG to move to the minimally loaded RG
++    for shard_index, gid := range self.Shards {
++      if gid == max_rg {
++        self.move(shard_index, min_rg)
++        break
++      }
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/shardmaster/server.go b/src/shardmaster/server.go
+index f31b7f1..0710f86 100644
+--- a/src/shardmaster/server.go
++++ b/src/shardmaster/server.go
+@@ -12,6 +12,16 @@ import "os"
+ import "syscall"
+ import "encoding/gob"
+ import "math/rand"
++import "time"
++import "strconv"
++
++const (
++  Join = "Join"
++  Leave = "Leave"
++  Move = "Move"
++  Query = "Query"
++  Noop = "Noop"
++)
+ 
+ type ShardMaster struct {
+ 	mu         sync.Mutex
+@@ -22,38 +32,308 @@ type ShardMaster struct {
+ 	px         *paxos.Paxos
+ 
+ 	configs []Config // indexed by config num
++	operation_number int  // agreement number of latest applied operation
+ }
+ 
+ 
+ type Op struct {
+ 	// Your data here.
++	Id string       // uuid
++	Name string     // Operation name: Join, Leave, Move, Query, Noop
++	Args Args       // Args may be a JoinArgs, LeaveArgs, MoveArgs, or QueryArgs
++}
++
++func generate_uuid() string {
++  return strconv.Itoa(rand.Int())
++}
++
++func makeOp(name string, args Args) (Op) {
++	return Op{Id: generate_uuid(),
++			Name: name,
++			Args: args,
++			}
+ }
+ 
+ 
++
++/*
++Return the last operation_number that was performed on the local configuration 
++state
++*/
++func (sm *ShardMaster) last_operation_number() int {
++	return sm.operation_number
++}
++
+ func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) error {
+ 	// Your code here.
++	sm.mu.Lock()
++	defer sm.mu.Unlock()
++
++	operation := makeOp(Join, *args)                    // requested Op
++	agreement_number := sm.paxos_agree(operation)     // sync call returns after agreement reached
+ 
++	sm.perform_operations_prior_to(agreement_number)  // sync call, operations up to limit performed
++	sm.perform_operation(agreement_number, operation) // perform requested Op
++
++	// JoinReply does not have fields that must be populated
+ 	return nil
+ }
+ 
+ func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) error {
+ 	// Your code here.
++	sm.mu.Lock()
++	defer sm.mu.Unlock()
++
++	operation := makeOp(Leave, *args)                   // requested Op
++	agreement_number := sm.paxos_agree(operation)     // sync call returns after agreement reached
+ 
++	sm.perform_operations_prior_to(agreement_number)  // sync call, operations up to limit performed
++	sm.perform_operation(agreement_number, operation) // perform requested Op
++
++	// LeaveReply does not have fields that must be populated
+ 	return nil
+ }
+ 
+ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) error {
+ 	// Your code here.
++	sm.mu.Lock()
++	defer sm.mu.Unlock()
++
++	operation := makeOp(Move, *args)                    // requested Op
++	agreement_number := sm.paxos_agree(operation)     // sync call returns after agreement reached
+ 
++	sm.perform_operations_prior_to(agreement_number)  // sync call, operations up to limit performed
++	sm.perform_operation(agreement_number, operation) // perform requested Op
++
++	// MoveReply does not have fields that must be populated
+ 	return nil
+ }
+ 
+ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) error {
+ 	// Your code here.
++    sm.mu.Lock()
++	defer sm.mu.Unlock()
++
++	operation := makeOp(Query, *args)                   // requested Op
++	agreement_number := sm.paxos_agree(operation)     // sync call returns after agreement reached
++
++	sm.perform_operations_prior_to(agreement_number)  // sync call, operations up to limit performed
++	config := sm.perform_operation(agreement_number, operation) // perform requested Op
++
++	reply.Config = config.(Config)                      // type assertion
++	return nil
++}
++
++// Methods for Using the Paxos Library
++///////////////////////////////////////////////////////////////////////////////
++
++/*
++Accepts an operation struct and drives agreement among Shardmaster paxos peers.
++Returns the int agreement number the paxos peers collectively decided to assign 
++the operation. Will not return until agreement is reached.
++*/
++func (sm *ShardMaster) paxos_agree(operation Op) (int) {
++	var agreement_number int
++	var decided_operation = Op{}
++
++	for decided_operation.Id != operation.Id {
++	agreement_number = sm.available_agreement_number()
++	//fmt.Printf("Proposing %+v with agreement_number:%d\n", operation, agreement_number)
++	sm.px.Start(agreement_number, operation)
++	decided_operation = sm.await_paxos_decision(agreement_number).(Op)  // type assertion
++	}
++	return agreement_number
++}
++
++
++/*
++Returns the decision value reached by the paxos peers for the given agreement_number. 
++This is done by calling the Status method of the local Paxos instance periodically,
++frequently at first and less frequently later, using binary exponential backoff.
++*/
++func (sm *ShardMaster) await_paxos_decision(agreement_number int) (decided_val interface{}) {
++	sleep_max := 10 * time.Second
++	sleep_time := 10 * time.Millisecond
++	for {
++	has_decided, decided_val := sm.px.Status(agreement_number)
++	if has_decided == paxos.Decided {
++		return decided_val
++	}
++	time.Sleep(sleep_time)
++	if sleep_time < sleep_max {
++		sleep_time *= 2
++	}
++	}
++	panic("unreachable")
++}
++
++/*
++Returns the next available agreement number (i.e. this paxos peer has not observed 
++that a value was decided upon for the agreement number). This agreement number
++may be tried when proposing new operations to peers.
++*/
++func (sm *ShardMaster) available_agreement_number() int {
++	return sm.px.Max() + 1
++}
++
++/*
++Wrapper around the server's paxos instance px.Status call which converts the (bool,
++interface{} value returned by Paxos into a (bool, Op) pair. 
++Accepts the agreement number which should be passed to the paxos Status call and 
++panics if the paxos value is not an Op.
++*/
++func (sm *ShardMaster) px_status_op(agreement_number int) (bool, Op){
++	has_decided, value := sm.px.Status(agreement_number)
++	if has_decided == paxos.Decided {
++	operation, ok := value.(Op)    // type assertion, Op expected
++	if ok {
++		return true, operation
++	}
++	panic("expected Paxos agreement instance values of type Op at runtime. Type assertion failed.")
++	}
++	return false, Op{}
++}
++
++/*
++Attempts to use the given operation struct to drive agreement among Shardmaster paxos 
++peers using the given agreement number. Discovers the operation that was decided on
++for the specified agreement number.
++*/
++func (sm *ShardMaster) drive_discovery(operation Op, agreement_number int) {
++	sm.px.Start(agreement_number, operation)
++	sm.await_paxos_decision(agreement_number)
++}
++
++
++// Methods for Performing ShardMaster Operations
++///////////////////////////////////////////////////////////////////////////////
++
++/*
++Synchronously performs all operations up to but NOT including the 'limit' op_number.
++The set of operations to be performed may not all yet be known to the local paxos
++instance so it will propose No_Ops to discover missing operations.
++*/
++func (sm *ShardMaster) perform_operations_prior_to(limit int) {
++	op_number := sm.last_operation_number() + 1    // op number currently being performed
++	has_decided, operation := sm.px_status_op(op_number)
++
++	for op_number < limit {       // continue looping until op_number == limit - 1 has been performed   
++	if has_decided {
++		sm.perform_operation(op_number, operation)
++		op_number = sm.last_operation_number() + 1
++		has_decided, operation = sm.px_status_op(op_number)
++	} else {
++		noop := makeOp(Noop, NoopArgs{})             // Force Paxos instance to discover next operation or agree on a NO_OP
++		sm.drive_discovery(noop, op_number)  // proposes Noop or discovers decided operation.
++		has_decided, operation = sm.px_status_op(op_number)
++		sm.perform_operation(op_number, operation)
++		op_number = sm.last_operation_number() + 1
++		has_decided, operation = sm.px_status_op(op_number)
++	}
++	}
++}
++
++/*
++Accepts an Op operation which should be performed locally, reads the name of the
++operation and calls the appropriate handler by passing the operation arguments.
++Returns the Result returned by the called operation and increments the ShardMaster 
++operation_number to the latest operation which has been performed (performed in 
++increasing order).
++*/
++func (sm *ShardMaster) perform_operation(op_number int, operation Op) Result {
++	var result Result
+ 
++	switch operation.Name {
++	case "Join":
++		var join_args = (operation.Args).(JoinArgs)     // type assertion, Args is a JoinArgs
++		result = sm.join(&join_args)
++	case "Leave":
++		var leave_args = (operation.Args).(LeaveArgs)   // type assertion, Args is a LeaveArgs
++		result = sm.leave(&leave_args)
++	case "Move":
++		var move_args = (operation.Args).(MoveArgs)     // type assertion, Args is a MoveArgs
++		result = sm.move(&move_args)
++	case "Query":
++		var query_args = (operation.Args).(QueryArgs)   // type assertion, Args is a QueryArgs
++		result = sm.query(&query_args)
++	case "Noop":
++	  // zero-valued result of type interface{} is nil
++	default:
++		panic(fmt.Sprintf("unexpected Op name '%s' cannot be performed", operation.Name))
++	}
++	sm.operation_number = op_number     // latest operation that has been applied
++	sm.px.Done(op_number)               // local Paxos no longer needs to remember Op
++	return result
++}
++
++// ShardMaster RPC operations (internal, performed after paxos agreement)
++///////////////////////////////////////////////////////////////////////////////
++
++/*
++Creates a new Config by adding a new replica group, attempts to promote shards on invalid 
++replica groups to valid replica groups (one may be available after adding a RG), and 
++rebalances the shards.
++Mutates ShardMaster.configs slice to append the new Config. Caller responsible for obtaining
++a ShardMaster lock.
++*/
++func (sm *ShardMaster) join(args *JoinArgs) Result {
++	prior_config := sm.configs[len(sm.configs)-1]   // previous Config in ShardMaster.configs
++	config := prior_config.copy()                       // newly created Config
++
++	config.add_replica_group(args.GID, args.Servers)
++	config.promote_shards_from_nonvalids()
++	config.rebalance(1)
++	sm.configs = append(sm.configs, config)
++	return nil
++}
++
++/*
++Creates a new Config by removing a replica group, reassigning shards that were assigned to
++the RG to minimally loaded RGs, and rebalances the shards.
++Mutates ShardMaster.configs slice to append the new Config. Caller responsible for obtaining
++a ShardMaster lock.
++*/
++func (sm *ShardMaster) leave(args *LeaveArgs) Result {
++	prior_config := sm.configs[len(sm.configs)-1]   // previous Config in ShardMaster.configs
++	config := prior_config.copy()                       // newly created Config
++
++	config.remove_replica_group(args.GID)
++	config.reassign_shards(args.GID)
++	config.rebalance(1)
++	sm.configs = append(sm.configs, config)
++	return nil
++}
++
++/*
++Creates a new Config by moving the specified shard to the speicifed replica group gid and
++assumes that the gid is allowed (does not validate against Config.Groups).
++Mutates ShardMaster.configs slice to append the new Config. Caller responsible for obtaining
++a ShardMaster lock.
++*/
++func (sm *ShardMaster) move(args *MoveArgs) Result {
++	prior_config := sm.configs[len(sm.configs)-1]   // previous Config in ShardMaster.configs
++	config := prior_config.copy()                       // newly created Config
++
++	config.explicit_move(args.Shard, args.GID)
++	// DO NOT rebalance. An explicit move was made by the administrator.
++	// TODO: figure out exactly when migrate lonely shards should be done
++	sm.configs = append(sm.configs, config)
+ 	return nil
+ }
+ 
++/*
++Returns the Config numbered with the specified Num or returns the latest Config otherwise,
++such as if Num = -1.
++*/
++func (sm *ShardMaster) query(args *QueryArgs) Result {
++  if args.Num >= 0 && args.Num <= (len(sm.configs) - 1) {
++    return sm.configs[args.Num]
++  } 
++  // Otherwise, fetch the latest Config
++  return sm.configs[len(sm.configs)-1]
++}
++
++
+ // please don't change these two functions.
+ func (sm *ShardMaster) Kill() {
+ 	atomic.StoreInt32(&sm.dead, 1)
+@@ -91,10 +371,17 @@ func StartServer(servers []string, me int) *ShardMaster {
+ 
+ 	sm.configs = make([]Config, 1)
+ 	sm.configs[0].Groups = map[int64][]string{}
++	sm.operation_number = -1                     // first agreement number is 0
+ 
+ 	rpcs := rpc.NewServer()
+ 
+ 	gob.Register(Op{})
++	// RPC library needs to know how to marshall/unmarshall the different types of Args
++	gob.Register(JoinArgs{})
++	gob.Register(LeaveArgs{})
++	gob.Register(MoveArgs{})
++	gob.Register(QueryArgs{})
++	gob.Register(NoopArgs{})
+ 	rpcs.Register(sm)
+ 	sm.px = paxos.Make(servers, me, rpcs)
+ 
+-- 
+2.10.1
+
